@@ -120,7 +120,7 @@ def fetch_kucoin_klines(symbol: str, tf_label: str, limit: int = 250) -> pd.Data
     resp = requests.get(
         f"{KUCOIN_BASE_URL}/api/v1/market/candles",
         params={"symbol": kc_symbol, "type": kc_type},
-        timeout=10,
+        timeout=8,
     )
     resp.raise_for_status()
     raw = resp.json().get("data", [])
@@ -147,7 +147,7 @@ def fetch_kucoin_last_price(symbol: str) -> Optional[float]:
     resp = requests.get(
         f"{KUCOIN_BASE_URL}/api/v1/market/orderbook/level1",
         params={"symbol": kc_symbol},
-        timeout=8,
+        timeout=6,
     )
     resp.raise_for_status()
     data = resp.json().get("data") or {}
@@ -165,7 +165,7 @@ def fetch_web_reference_prices(coins: Tuple[str, ...]) -> Dict[str, Optional[flo
         resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": ",".join(sorted(set(ids))), "vs_currencies": "usd"},
-            timeout=8,
+            timeout=6,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -198,10 +198,6 @@ def compute_price_correlation(
 
 
 def fetch_liquidation_snapshot(coin: str, last_price: Optional[float]) -> Dict[str, Optional[float] | str]:
-    """
-    Free liquidation zone estimator anchored to KuCoin price & swing liquidity
-    (ready to swap with a free live liquidation endpoint when desired).
-    """
     if last_price is None or last_price <= 0:
         return {
             "liq_bias": "Neutral",
@@ -253,64 +249,3 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean().bfill()
-
-
-def generate_layman_ai_summary(
-    summary_payload: Dict[str, object],
-    api_key: str = "",
-) -> str:
-    """
-    Uses an OpenAI-compatible chat endpoint if api_key is provided;
-    otherwise returns a clear layman-language summary from the signal metrics.
-    """
-    if api_key.strip():
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key.strip()}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You explain crypto harmonic Bat trading setups in plain, simple, "
-                                "layman language without jargon. Highlight entry patience, risk/SL buffer, "
-                                "higher-timeframe pull/opposition, and what to watch next."
-                            ),
-                        },
-                        {"role": "user", "content": str(summary_payload)},
-                    ],
-                    "temperature": 0.3,
-                },
-                timeout=12,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            if content:
-                return content.strip()
-        except Exception as exc:
-            fallback_note = f"(AI key call fell back to plain summary: {exc})\n\n"
-        else:
-            fallback_note = ""
-    else:
-        fallback_note = ""
-
-    coin = summary_payload.get("coin", "This coin")
-    tf = summary_payload.get("timeframe", "")
-    direction = summary_payload.get("pattern_type", "")
-    stage = summary_payload.get("status_label", "")
-    score = summary_payload.get("total_score", 0)
-    notes = summary_payload.get("notes", [])
-    note_txt = " ".join(notes) if isinstance(notes, list) and notes else "No major timeframe warning right now."
-
-    return (
-        f"{fallback_note}"
-        f"**Plain Summary for {coin} ({tf}) — {direction} [{stage}]:** "
-        f"Overall setup score is **{score}/100**. {note_txt} "
-        f"In simple terms, wait for price to settle cleanly inside the optimal reversal zone rather than rushing in early, "
-        f"and keep an eye on nearby support/resistance walls and your stop-loss buffer if price spikes with a wick."
-    )
