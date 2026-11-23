@@ -11,6 +11,7 @@ from bat_engine import BatScanResult, enrich_multi_timeframe_context, run_bat_en
 from market_data import (
     DEFAULT_PERP_SYMBOLS,
     TF_HOURS,
+    TF_ORDER,
     TIMEFRAME_OPTIONS,
     TV_INTERVAL_MAP,
     clean_coin_name,
@@ -45,6 +46,15 @@ def fmt_price(val: Optional[float]) -> str:
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return "-"
     return f"${val:.6f}".rstrip("0").rstrip(".")
+
+
+def format_tf_counts(items: List[BatScanResult], tfs: List[str]) -> str:
+    ordered_tfs = [tf for tf in TF_ORDER if tf in tfs] + [tf for tf in tfs if tf not in TF_ORDER]
+    parts: List[str] = []
+    for tf in ordered_tfs:
+        count = sum(1 for item in items if item.timeframe == tf)
+        parts.append(f"{tf} ({count})")
+    return " · ".join(parts)
 
 
 def compute_tp_progress(
@@ -246,7 +256,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Live Scanning (Non-Blocking)")
-    # Default False so background timers never interrupt active work or freeze the page
     auto_refresh = st.checkbox("Auto-update active monitor fragment", value=False)
     refresh_sec = st.slider("Fragment update interval (sec)", min_value=15, max_value=180, value=30, step=5)
 
@@ -391,7 +400,7 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
         setup_context=target_ctx,
         all_committed_trades=st.session_state.active_trades,
         audit_history=st.session_state.audit_logs,
-        api_key=ai_api_key or None,
+        api_key=ai_api_key,
     )
     st.session_state.ai_summaries[t_key] = t_summary
     save_summary(t_key, target_coin, target_tf, t_summary)
@@ -406,12 +415,13 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
             setup_context=tr,
             all_committed_trades=st.session_state.active_trades,
             audit_history=st.session_state.audit_logs,
-            api_key=ai_api_key or None,
+            api_key=ai_api_key,
         )
         st.session_state.ai_summaries[ckey] = csum
         save_summary(ckey, c, tf, csum)
 
 
+# 1. ACTIVE TRADE MONITORING TERMINAL
 def _render_active_monitor_body() -> None:
     st.subheader(f"Active Trade Monitoring Terminal ({len(st.session_state.active_trades)} / 10 Locked)")
     if st.session_state.active_trades:
@@ -562,7 +572,8 @@ with pattern_tabs[0]:
     conf_items = [r for r in results if r.status_label == "CONFIRMED"]
 
     def render_signal_panel(title: str, items: List[BatScanResult], is_confirmed: bool) -> None:
-        st.subheader(title)
+        st.subheader(f"{title} ({len(items)})")
+        st.caption(f"Timeframes: {format_tf_counts(items, selected_tfs)}")
         if not items:
             st.info(f"No {title.lower()} setups right now.")
             return
@@ -729,7 +740,7 @@ with detail_tabs[0]:
 
         if st.session_state.show_summary_toggle and has_csum:
             st.info(st.session_state.ai_summaries[c_key])
-        elif not has_sum:
+        elif not has_csum:
             st.caption("Click **Run AI Summary** to generate a layman institutional opinion and sync across committed trades.")
 
         if show_chart_audit:
