@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from market_data import compute_atr, compute_rsi, compute_stoch_rsi
+from market_data import TF_ORDER, compute_atr, compute_rsi, compute_stoch_rsi
 
 
 @dataclass
@@ -19,15 +19,25 @@ class BatScanResult:
     pattern_type: str  # "BULLISH" | "BEARISH" | ""
     overstretched: bool
     conf_score: int  # 0..3
-    conf_pct: float  # e.g. 33.3, 66.7, 100.0
+    conf_pct: float
+    total_score: int  # 0..100 composite score after HTF, vol, volume & distance adjustments
+    score_adjustments: List[str] = field(default_factory=list)
     bad_confluences: List[str] = field(default_factory=list)
+    mtf_notes: List[str] = field(default_factory=list)
     entry_d: Optional[float] = None
+    optimal_zone_low: Optional[float] = None
+    optimal_zone_high: Optional[float] = None
     sl: Optional[float] = None
+    suggested_sl: Optional[float] = None
+    bias_change_level: Optional[float] = None
     tp1: Optional[float] = None
     tp2: Optional[float] = None
     tp3: Optional[float] = None
     tp1_hit: bool = False
     tp2_hit: bool = False
+    nearest_support: Optional[float] = None
+    nearest_resistance: Optional[float] = None
+    tp_obstacle_note: str = "Clear path"
     zone_low: Optional[float] = None
     zone_high: Optional[float] = None
     zone_label: str = "-"
@@ -77,14 +87,17 @@ def run_bat_engine(
             overstretched=False,
             conf_score=0,
             conf_pct=0.0,
+            total_score=0,
             last_close=float(df["close"].iloc[-1]) if df is not None and len(df) > 0 else None,
         )
 
     high = df["high"].to_numpy(dtype=float)
     low = df["low"].to_numpy(dtype=float)
     close = df["close"].to_numpy(dtype=float)
+    volume = df["volume"].to_numpy(dtype=float) if "volume" in df.columns else np.ones(len(df))
 
-    atr = compute_atr(df, params["atr_len"]).to_numpy(dtype=float)
+    atr_series = compute_atr(df, params["atr_len"])
+    atr = atr_series.to_numpy(dtype=float)
     sigma_basis = df["close"].rolling(params["sigma_len"], min_periods=1).mean().to_numpy(dtype=float)
     sigma_dev = (
         df["close"].rolling(params["sigma_len"], min_periods=1).std(ddof=0).fillna(0.0).to_numpy(dtype=float)
@@ -107,8 +120,10 @@ def run_bat_engine(
     pv_r = params["pivot_right"]
     atr_m = params["atr_mult"]
 
-    piv_h_set = set(_pivot_highs(high, pv_l, pv_r))
-    piv_l_set = set(_pivot_lows(low, pv_l, pv_r))
+    piv_h_idx = _pivot_highs(high, pv_l, pv_r)
+    piv_l_idx = _pivot_lows(low, pv_l, pv_r)
+    piv_h_set = set(piv_h_idx)
+    piv_l_set = set(piv_l_idx)
 
     high_idx_arr: List[int] = []
     high_prc_arr: List[float] = []
@@ -245,6 +260,12 @@ def run_bat_engine(
     cur_k = float(stoch_k[last_i])
     cur_d = float(stoch_d[last_i])
     cur_ema = float(ema_trend[last_i])
+    cur_atr = float(atr[last_i])
+    avg_atr = float(np.nanmean(atr[max(0, last_i - 30) : last_i + 1])) or cur_atr
+
+    vol_recent = float(np.nanmean(volume[max(0, last_i - 5) : last_i + 1]))
+    vol_base = float(np.nanmean(volume[max(0, last_i - 30) : last_i + 1])) or 1.0
+    vol_ratio = vol_recent / vol_base
 
     overstretched = False
     if internal_state == 1:
@@ -294,34 +315,105 @@ def run_bat_engine(
         status_label = "IDLE"
         sig_code = "-"
 
+    # Nearest swing support & resistance walls
+    supports = [float(low[i]) for i in piv_l_idx if float(low[i]) < cur_close]
+    resistances = [float(high[i]) for i in piv_h_idx if float(high[i]) > cur_close]
+    nearest_support = max(supports) if supports else None
+    nearest_resistance = min(resistances) if resistances else None
+
     zone_low: Optional[float] = None
     zone_high: Optional[float] = None
+    optimal_zone_low: Optional[float] = None
+    optimal_zone_high: Optional[float] = None
+    suggested_sl: Optional[float] = None
+    bias_change_level: Optional[float] = None
+    tp_obstacle_note = "Clear path"
     zone_label = "-"
     beyond_optimal_entry = False
     optimal_entry_status = "-"
 
+    score_adjustments: List[str] = []
+    total_score = 45 + (conf_score * 15) if internal_state in (1, 2) else 0
+
     if internal_state in (1, 2) and not np.isnan(d_price) and not np.isnan(price_sl):
-        zone_low = float(min(d_price, price_sl))
-        zone_high = float(max(d_price, price_sl))
+        d_f = float(d_price)
+        sl_f = float(price_sl)
+        zone_low = float(min(d_f, sl_f))
+        zone_high = float(max(d_f, sl_f))
         zone_label = "Demand Zone (Reversal)" if pattern_type == "BULLISH" else "Supply Zone (Reversal)"
 
-        tol = max(abs(float(d_price)) * 0.004, float(atr[last_i]) * 0.2)
+        opt_pad = max(abs(d_f) * 0.0035, cur_atr * 0.25)
+        optimal_zone_low = d_f - opt_pad
+        optimal_zone_high = d_f + opt_pad
+
+        # Suggested SL gives extra wick cushion beyond primary SL, and bias-change sits past structure/EMA
+        wick_cushion = cur_atr * 0.45
         if pattern_type == "BULLISH":
-            if cur_close < float(d_price) - tol:
+            suggested_sl = sl_f - wick_cushion
+            bias_change_level = float(min(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
+            if cur_close < d_f - opt_pad:
                 beyond_optimal_entry = True
                 optimal_entry_status = "Beyond Optimal Entry (Below D)"
-            elif abs(cur_close - float(d_price)) <= tol:
-                optimal_entry_status = "In Optimal Entry Zone"
+            elif abs(cur_close - d_f) <= opt_pad:
+                optimal_entry_status = "In Optimal Reversal Zone"
             else:
-                optimal_entry_status = "Approaching D" if internal_state == 1 else "Above D (Rebounding)"
+                optimal_entry_status = "Wait for Optimal Reversal Zone (Above D)"
+
+            if nearest_resistance is not None:
+                if price_tp1 is not None and not np.isnan(price_tp1) and nearest_resistance < float(price_tp1):
+                    tp_obstacle_note = f"Resistance wall @ {nearest_resistance:.6f} before TP1"
+                    total_score -= 8
+                    score_adjustments.append("-8 (Resistance before TP1)")
+                elif price_tp2 is not None and not np.isnan(price_tp2) and nearest_resistance < float(price_tp2):
+                    tp_obstacle_note = f"Resistance wall @ {nearest_resistance:.6f} before TP2"
+                    total_score -= 4
+                    score_adjustments.append("-4 (Resistance before TP2)")
+
         elif pattern_type == "BEARISH":
-            if cur_close > float(d_price) + tol:
+            suggested_sl = sl_f + wick_cushion
+            bias_change_level = float(max(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
+            if cur_close > d_f + opt_pad:
                 beyond_optimal_entry = True
                 optimal_entry_status = "Beyond Optimal Entry (Above D)"
-            elif abs(cur_close - float(d_price)) <= tol:
-                optimal_entry_status = "In Optimal Entry Zone"
+            elif abs(cur_close - d_f) <= opt_pad:
+                optimal_entry_status = "In Optimal Reversal Zone"
             else:
-                optimal_entry_status = "Approaching D" if internal_state == 1 else "Below D (Pulling Back)"
+                optimal_entry_status = "Wait for Optimal Reversal Zone (Below D)"
+
+            if nearest_support is not None:
+                if price_tp1 is not None and not np.isnan(price_tp1) and nearest_support > float(price_tp1):
+                    tp_obstacle_note = f"Support wall @ {nearest_support:.6f} before TP1"
+                    total_score -= 8
+                    score_adjustments.append("-8 (Support before TP1)")
+                elif price_tp2 is not None and not np.isnan(price_tp2) and nearest_support > float(price_tp2):
+                    tp_obstacle_note = f"Support wall @ {nearest_support:.6f} before TP2"
+                    total_score -= 4
+                    score_adjustments.append("-4 (Support before TP2)")
+
+        # Volatility, volume & distance scoring
+        if cur_atr > avg_atr * 1.35:
+            total_score -= 6
+            score_adjustments.append("-6 (High ATR Spike / Wick Risk)")
+        elif cur_atr <= avg_atr * 1.1:
+            total_score += 5
+            score_adjustments.append("+5 (Controlled Volatility)")
+
+        if vol_ratio >= 1.25:
+            total_score += 6
+            score_adjustments.append("+6 (Strong Volume Follow-Through)")
+        elif vol_ratio < 0.7:
+            total_score -= 5
+            score_adjustments.append("-5 (Low Volume)")
+
+        dist_pct = abs(cur_close - d_f) / max(abs(d_f), 1e-9) * 100.0
+        if dist_pct <= 1.2:
+            total_score += 5
+            score_adjustments.append("+5 (Close to Reversal Zone)")
+        elif dist_pct > 5.0:
+            total_score -= 6
+            score_adjustments.append("-6 (Extended Distance to D)")
+
+    total_score = int(max(0, min(100, total_score)))
 
     pivots: Dict[str, Tuple[int, float]] = {}
     leg_statuses: Dict[str, str] = {}
@@ -350,14 +442,23 @@ def run_bat_engine(
         overstretched=overstretched,
         conf_score=conf_score,
         conf_pct=conf_pct,
+        total_score=total_score,
+        score_adjustments=score_adjustments,
         bad_confluences=bad_confluences,
         entry_d=None if np.isnan(d_price) else float(d_price),
+        optimal_zone_low=optimal_zone_low,
+        optimal_zone_high=optimal_zone_high,
         sl=None if np.isnan(price_sl) else float(price_sl),
+        suggested_sl=suggested_sl,
+        bias_change_level=bias_change_level,
         tp1=None if np.isnan(price_tp1) else float(price_tp1),
         tp2=None if np.isnan(price_tp2) else float(price_tp2),
         tp3=None if np.isnan(price_tp3) else float(price_tp3),
         tp1_hit=tp1_hit,
         tp2_hit=tp2_hit,
+        nearest_support=nearest_support,
+        nearest_resistance=nearest_resistance,
+        tp_obstacle_note=tp_obstacle_note,
         zone_low=zone_low,
         zone_high=zone_high,
         zone_label=zone_label,
@@ -367,3 +468,53 @@ def run_bat_engine(
         pivots=pivots,
         leg_statuses=leg_statuses,
     )
+
+
+def enrich_multi_timeframe_context(results: List[BatScanResult]) -> List[BatScanResult]:
+    """
+    Evaluates higher-timeframe 'READY TO BE' or 'CONFIRMED' patterns for each coin:
+    - Same-direction HTF 'READY TO BE': price likely travels toward that HTF zone before reversing.
+    - Opposing HTF 'READY TO BE' (e.g. 1H bullish while 4H/1D bearish is forming): TPs on current
+      move may feed into forming the higher-timeframe setup—wait for optimal reversal zone.
+    """
+    by_coin: Dict[str, Dict[str, BatScanResult]] = {}
+    for r in results:
+        by_coin.setdefault(r.coin, {})[r.timeframe] = r
+
+    for r in results:
+        if r.status_label == "IDLE":
+            continue
+        tf_map = by_coin.get(r.coin, {})
+        cur_rank = TF_ORDER.index(r.timeframe) if r.timeframe in TF_ORDER else 0
+        higher_tfs = [t for t in TF_ORDER[cur_rank + 1 :] if t in tf_map]
+
+        notes: List[str] = []
+        adj = r.total_score
+
+        for htf in higher_tfs:
+            hr = tf_map[htf]
+            if hr.status_label == "READY TO BE" and hr.pattern_type == r.pattern_type:
+                notes.append(
+                    f"{htf} {hr.pattern_type} is READY TO BE — price may drive toward {htf} reversal zone before turning."
+                )
+                if r.status_label == "CONFIRMED":
+                    adj += 5
+                    r.score_adjustments.append(f"+5 ({htf} Same-Dir Forming)")
+            elif hr.status_label == "READY TO BE" and hr.pattern_type != r.pattern_type and hr.pattern_type:
+                notes.append(
+                    f"{htf} {hr.pattern_type} is READY TO BE — current {r.pattern_type} move/TPs may build {htf} setup; avoid rushing entry."
+                )
+                adj -= 7
+                r.score_adjustments.append(f"-7 ({htf} Opposing Forming)")
+            elif hr.status_label == "CONFIRMED" and hr.pattern_type == r.pattern_type:
+                notes.append(f"{htf} {hr.pattern_type} is CONFIRMED — aligned with higher timeframe.")
+                adj += 6
+                r.score_adjustments.append(f"+6 ({htf} Confirmed Alignment)")
+
+        if not notes:
+            notes.append("Higher timeframes show no conflicting forming pattern; wait for optimal reversal zone.")
+
+        r.mtf_notes = notes
+        r.total_score = int(max(0, min(100, adj)))
+
+    return results
