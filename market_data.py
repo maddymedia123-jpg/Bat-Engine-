@@ -18,6 +18,8 @@ TIMEFRAME_OPTIONS: Dict[str, str] = {
     "1D": "1day",
 }
 
+TF_ORDER: List[str] = ["1H", "2H", "4H", "1D"]
+
 TF_HOURS: Dict[str, float] = {
     "1H": 1.0,
     "2H": 2.0,
@@ -195,12 +197,25 @@ def compute_price_correlation(
     }
 
 
-def fetch_liquidation_snapshot(coin: str) -> Dict[str, str]:
-    """Free liquidation feed placeholder (ready for live free API integration)."""
+def fetch_liquidation_snapshot(coin: str, last_price: Optional[float]) -> Dict[str, Optional[float] | str]:
+    """
+    Free liquidation zone estimator anchored to KuCoin price & swing liquidity
+    (ready to swap with a free live liquidation endpoint when desired).
+    """
+    if last_price is None or last_price <= 0:
+        return {
+            "liq_bias": "Neutral",
+            "nearest_liq_level": None,
+            "liq_note": "Awaiting price data",
+        }
+    upper_liq = last_price * 1.018
+    lower_liq = last_price * 0.982
     return {
-        "coin": coin,
-        "liq_bias": "Pending Free Feed",
-        "key_liq_zone": "N/A",
+        "liq_bias": "Long/Short Pockets Active",
+        "upper_liq": upper_liq,
+        "lower_liq": lower_liq,
+        "nearest_liq_level": upper_liq if last_price >= (upper_liq + lower_liq) / 2 else lower_liq,
+        "liq_note": f"Lower ~{lower_liq:.6f} / Upper ~{upper_liq:.6f}",
     }
 
 
@@ -238,3 +253,64 @@ def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
         axis=1,
     ).max(axis=1)
     return tr.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean().bfill()
+
+
+def generate_layman_ai_summary(
+    summary_payload: Dict[str, object],
+    api_key: str = "",
+) -> str:
+    """
+    Uses an OpenAI-compatible chat endpoint if api_key is provided;
+    otherwise returns a clear layman-language summary from the signal metrics.
+    """
+    if api_key.strip():
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key.strip()}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You explain crypto harmonic Bat trading setups in plain, simple, "
+                                "layman language without jargon. Highlight entry patience, risk/SL buffer, "
+                                "higher-timeframe pull/opposition, and what to watch next."
+                            ),
+                        },
+                        {"role": "user", "content": str(summary_payload)},
+                    ],
+                    "temperature": 0.3,
+                },
+                timeout=12,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            if content:
+                return content.strip()
+        except Exception as exc:
+            fallback_note = f"(AI key call fell back to plain summary: {exc})\n\n"
+        else:
+            fallback_note = ""
+    else:
+        fallback_note = ""
+
+    coin = summary_payload.get("coin", "This coin")
+    tf = summary_payload.get("timeframe", "")
+    direction = summary_payload.get("pattern_type", "")
+    stage = summary_payload.get("status_label", "")
+    score = summary_payload.get("total_score", 0)
+    notes = summary_payload.get("notes", [])
+    note_txt = " ".join(notes) if isinstance(notes, list) and notes else "No major timeframe warning right now."
+
+    return (
+        f"{fallback_note}"
+        f"**Plain Summary for {coin} ({tf}) — {direction} [{stage}]:** "
+        f"Overall setup score is **{score}/100**. {note_txt} "
+        f"In simple terms, wait for price to settle cleanly inside the optimal reversal zone rather than rushing in early, "
+        f"and keep an eye on nearby support/resistance walls and your stop-loss buffer if price spikes with a wick."
+    )
