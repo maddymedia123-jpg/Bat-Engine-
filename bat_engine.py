@@ -31,6 +31,7 @@ class BatScanResult:
     optimal_zone_high: Optional[float] = None
     sl: Optional[float] = None
     secondary_sl: Optional[float] = None
+    break_even_sl: Optional[float] = None
     bias_change_level: Optional[float] = None
     tp1: Optional[float] = None
     tp2: Optional[float] = None
@@ -207,7 +208,6 @@ def run_bat_engine(
         cur_high = float(high[bar_idx])
         cur_low = float(low[bar_idx])
 
-        # Exact Pine v6: if internalState == 0 or internalState == 3
         if internal_state == 0 or internal_state == 3:
             if len(low_prc_arr) >= 2 and len(high_prc_arr) >= 2:
                 px_i, px_p = low_idx_arr[1], low_prc_arr[1]
@@ -234,7 +234,6 @@ def run_bat_engine(
                         price_sl = (a_price - (1.113 * xa_h)) - (cur_atr * atr_m)
                         price_tp1 = price_tp2 = price_tp3 = np.nan
 
-            # Exact Pine v6: if internalState == 0 and array.size(high_prc_arr) >= 2 ...
             if internal_state == 0 and len(high_prc_arr) >= 2 and len(low_prc_arr) >= 2:
                 px_i, px_p = high_idx_arr[1], high_prc_arr[1]
                 pa_i, pa_p = low_idx_arr[1], low_prc_arr[1]
@@ -354,11 +353,6 @@ def run_bat_engine(
 
     conf_pct = round((conf_score / 3.0) * 100.0, 1)
 
-    # Matches Pine table:
-    # internalState == 1 -> READY TO BE ("READY (Execute)" or "WAIT (Overstretched)")
-    # internalState == 2 -> CONFIRMED ("{patternType} ACTIVE")
-    # internalState == 3 -> IDLE ("INVALID: {errorMsg}")
-    # internalState == 0 -> IDLE ("Hunting Waves")
     if internal_state == 1:
         status_label = "READY TO BE"
         status_desc = "WAIT (Overstretched)" if overstretched else "READY (Execute)"
@@ -389,6 +383,7 @@ def run_bat_engine(
     optimal_zone_low: Optional[float] = None
     optimal_zone_high: Optional[float] = None
     secondary_sl: Optional[float] = None
+    break_even_sl: Optional[float] = None
     bias_change_level: Optional[float] = None
     tp_obstacle_note = "Clear path"
     zone_label = "-"
@@ -422,6 +417,8 @@ def run_bat_engine(
         )
 
         if pattern_type == "BULLISH":
+            be_buf = max(abs(d_f) * 0.0005, cur_atr * 0.05)
+            break_even_sl = float(d_f + be_buf)
             bias_change_level = float(min(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
             if cur_close < d_f - opt_pad:
                 beyond_optimal_entry = True
@@ -437,6 +434,8 @@ def run_bat_engine(
                 score_adjustments.append("-8 (Resistance before TP1)")
 
         elif pattern_type == "BEARISH":
+            be_buf = max(abs(d_f) * 0.0005, cur_atr * 0.05)
+            break_even_sl = float(d_f - be_buf)
             bias_change_level = float(max(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
             if cur_close > d_f + opt_pad:
                 beyond_optimal_entry = True
@@ -504,6 +503,7 @@ def run_bat_engine(
         optimal_zone_high=optimal_zone_high,
         sl=None if np.isnan(price_sl) else float(price_sl),
         secondary_sl=secondary_sl,
+        break_even_sl=break_even_sl,
         bias_change_level=bias_change_level,
         tp1=None if np.isnan(price_tp1) else float(price_tp1),
         tp2=None if np.isnan(price_tp2) else float(price_tp2),
