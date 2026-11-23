@@ -153,6 +153,10 @@ def _bybit_candles(bybit_sym: str, tf_label: str, limit: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=25, show_spinner=False)
 def fetch_perp_klines(symbol: str, tf_label: str, limit: int = 250) -> pd.DataFrame:
+    """
+    Fetches perpetual swap futures OHLCV candles.
+    Primary: OKX USDT-SWAP; secondary: Bybit linear perpetuals; fallback: KuCoin.
+    """
     empty_df = pd.DataFrame(columns=["timestamp", "open", "close", "high", "low", "volume"])
     swap_id = _to_okx_swap(symbol)
     bybit_sym = _to_bybit_linear(symbol)
@@ -288,4 +292,48 @@ def fetch_liquidation_snapshot(coin: str, last_price: Optional[float]) -> Dict[s
             "nearest_liq_level": None,
             "liq_note": "Awaiting perp swap price data",
         }
-    upper
+    upper_liq = last_price * 1.018
+    lower_liq = last_price * 0.982
+    return {
+        "liq_bias": "Long/Short Pockets Active",
+        "upper_liq": upper_liq,
+        "lower_liq": lower_liq,
+        "nearest_liq_level": upper_liq if last_price >= (upper_liq + lower_liq) / 2 else lower_liq,
+        "liq_note": f"Lower ~{lower_liq:.6f} / Upper ~{upper_liq:.6f}",
+    }
+
+
+def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def compute_stoch_rsi(
+    rsi: pd.Series, stoch_len: int = 14, smooth_k: int = 3, smooth_d: int = 3
+) -> Tuple[pd.Series, pd.Series]:
+    min_rsi = rsi.rolling(stoch_len, min_periods=1).min()
+    max_rsi = rsi.rolling(stoch_len, min_periods=1).max()
+    denom = (max_rsi - min_rsi).replace(0.0, np.nan)
+    raw_k = ((rsi - min_rsi) / denom * 100.0).fillna(50.0)
+    k = raw_k.rolling(smooth_k, min_periods=1).mean()
+    d = k.rolling(smooth_d, min_periods=1).mean()
+    return k, d
+
+
+def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean().bfill()
