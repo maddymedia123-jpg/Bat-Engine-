@@ -15,20 +15,20 @@ class BatScanResult:
     timeframe: str
     state: int  # 0: idle, 1: READY TO BE, 2: CONFIRMED, 3: invalidated
     status_label: str  # "READY TO BE" | "CONFIRMED" | "IDLE"
-    sig_code: str  # e.g. R2, W1, C3, "-"
+    sig_code: str
     pattern_type: str  # "BULLISH" | "BEARISH" | ""
     overstretched: bool
-    conf_score: int  # 0..3
+    conf_score: int
     conf_pct: float
-    total_score: int  # 0..100 composite score after HTF, vol, volume & distance adjustments
+    total_score: int
     score_adjustments: List[str] = field(default_factory=list)
     bad_confluences: List[str] = field(default_factory=list)
     mtf_notes: List[str] = field(default_factory=list)
     entry_d: Optional[float] = None
     optimal_zone_low: Optional[float] = None
     optimal_zone_high: Optional[float] = None
-    sl: Optional[float] = None
-    suggested_sl: Optional[float] = None
+    sl: Optional[float] = None  # Strict Pine ATR stop-loss
+    secondary_sl: Optional[float] = None  # Suggested trailing / move-in-profit SL
     bias_change_level: Optional[float] = None
     tp1: Optional[float] = None
     tp2: Optional[float] = None
@@ -68,6 +68,52 @@ def _pivot_lows(low: np.ndarray, left: int, right: int) -> List[int]:
     return idxs
 
 
+def compute_dynamic_secondary_sl(
+    direction: str,
+    live_price: Optional[float],
+    entry_d: Optional[float],
+    primary_sl: Optional[float],
+    tp1: Optional[float],
+    atr_val: float,
+    recent_swing_low: Optional[float],
+    recent_swing_high: Optional[float],
+) -> Optional[float]:
+    """
+    Keeps Pine ATR SL as primary SL, and calculates a secondary SL once price
+    moves in the trade's direction (or uses a structural swing/ATR buffer).
+    """
+    if primary_sl is None or entry_d is None or live_price is None:
+        return primary_sl
+
+    if direction == "BULLISH":
+        in_profit = live_price > entry_d
+        tp1_reached = tp1 is not None and live_price >= tp1
+        candidate = primary_sl
+        if tp1_reached:
+            candidate = max(candidate, entry_d + (0.15 * max(0.0, (tp1 - entry_d))))
+        elif in_profit:
+            trail = live_price - (1.25 * atr_val)
+            if recent_swing_low is not None and recent_swing_low < live_price:
+                trail = max(trail, recent_swing_low - (0.25 * atr_val))
+            candidate = max(candidate, trail)
+        return float(candidate)
+
+    if direction == "BEARISH":
+        in_profit = live_price < entry_d
+        tp1_reached = tp1 is not None and live_price <= tp1
+        candidate = primary_sl
+        if tp1_reached:
+            candidate = min(candidate, entry_d - (0.15 * max(0.0, (entry_d - tp1))))
+        elif in_profit:
+            trail = live_price + (1.25 * atr_val)
+            if recent_swing_high is not None and recent_swing_high > live_price:
+                trail = min(trail, recent_swing_high + (0.25 * atr_val))
+            candidate = min(candidate, trail)
+        return float(candidate)
+
+    return primary_sl
+
+
 def run_bat_engine(
     df: pd.DataFrame,
     symbol: str,
@@ -96,8 +142,7 @@ def run_bat_engine(
     close = df["close"].to_numpy(dtype=float)
     volume = df["volume"].to_numpy(dtype=float) if "volume" in df.columns else np.ones(len(df))
 
-    atr_series = compute_atr(df, params["atr_len"])
-    atr = atr_series.to_numpy(dtype=float)
+    atr = compute_atr(df, params["atr_len"]).to_numpy(dtype=float)
     sigma_basis = df["close"].rolling(params["sigma_len"], min_periods=1).mean().to_numpy(dtype=float)
     sigma_dev = (
         df["close"].rolling(params["sigma_len"], min_periods=1).std(ddof=0).fillna(0.0).to_numpy(dtype=float)
@@ -315,7 +360,6 @@ def run_bat_engine(
         status_label = "IDLE"
         sig_code = "-"
 
-    # Nearest swing support & resistance walls
     supports = [float(low[i]) for i in piv_l_idx if float(low[i]) < cur_close]
     resistances = [float(high[i]) for i in piv_h_idx if float(high[i]) > cur_close]
     nearest_support = max(supports) if supports else None
@@ -325,7 +369,7 @@ def run_bat_engine(
     zone_high: Optional[float] = None
     optimal_zone_low: Optional[float] = None
     optimal_zone_high: Optional[float] = None
-    suggested_sl: Optional[float] = None
+    secondary_sl: Optional[float] = None
     bias_change_level: Optional[float] = None
     tp_obstacle_note = "Clear path"
     zone_label = "-"
@@ -338,6 +382,7 @@ def run_bat_engine(
     if internal_state in (1, 2) and not np.isnan(d_price) and not np.isnan(price_sl):
         d_f = float(d_price)
         sl_f = float(price_sl)
+        tp1_f = None if np.isnan(price_tp1) else float(price_tp1)
         zone_low = float(min(d_f, sl_f))
         zone_high = float(max(d_f, sl_f))
         zone_label = "Demand Zone (Reversal)" if pattern_type == "BULLISH" else "Supply Zone (Reversal)"
@@ -346,10 +391,18 @@ def run_bat_engine(
         optimal_zone_low = d_f - opt_pad
         optimal_zone_high = d_f + opt_pad
 
-        # Suggested SL gives extra wick cushion beyond primary SL, and bias-change sits past structure/EMA
-        wick_cushion = cur_atr * 0.45
+        secondary_sl = compute_dynamic_secondary_sl(
+            direction=pattern_type,
+            live_price=cur_close,
+            entry_d=d_f,
+            primary_sl=sl_f,
+            tp1=tp1_f,
+            atr_val=cur_atr,
+            recent_swing_low=nearest_support,
+            recent_swing_high=nearest_resistance,
+        )
+
         if pattern_type == "BULLISH":
-            suggested_sl = sl_f - wick_cushion
             bias_change_level = float(min(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
             if cur_close < d_f - opt_pad:
                 beyond_optimal_entry = True
@@ -360,7 +413,7 @@ def run_bat_engine(
                 optimal_entry_status = "Wait for Optimal Reversal Zone (Above D)"
 
             if nearest_resistance is not None:
-                if price_tp1 is not None and not np.isnan(price_tp1) and nearest_resistance < float(price_tp1):
+                if tp1_f is not None and nearest_resistance < tp1_f:
                     tp_obstacle_note = f"Resistance wall @ {nearest_resistance:.6f} before TP1"
                     total_score -= 8
                     score_adjustments.append("-8 (Resistance before TP1)")
@@ -370,7 +423,6 @@ def run_bat_engine(
                     score_adjustments.append("-4 (Resistance before TP2)")
 
         elif pattern_type == "BEARISH":
-            suggested_sl = sl_f + wick_cushion
             bias_change_level = float(max(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
             if cur_close > d_f + opt_pad:
                 beyond_optimal_entry = True
@@ -381,7 +433,7 @@ def run_bat_engine(
                 optimal_entry_status = "Wait for Optimal Reversal Zone (Below D)"
 
             if nearest_support is not None:
-                if price_tp1 is not None and not np.isnan(price_tp1) and nearest_support > float(price_tp1):
+                if tp1_f is not None and nearest_support > tp1_f:
                     tp_obstacle_note = f"Support wall @ {nearest_support:.6f} before TP1"
                     total_score -= 8
                     score_adjustments.append("-8 (Support before TP1)")
@@ -390,17 +442,16 @@ def run_bat_engine(
                     total_score -= 4
                     score_adjustments.append("-4 (Support before TP2)")
 
-        # Volatility, volume & distance scoring
         if cur_atr > avg_atr * 1.35:
             total_score -= 6
-            score_adjustments.append("-6 (High ATR Spike / Wick Risk)")
+            score_adjustments.append("-6 (High ATR Volatility)")
         elif cur_atr <= avg_atr * 1.1:
             total_score += 5
-            score_adjustments.append("+5 (Controlled Volatility)")
+            score_adjustments.append("+5 (Controlled ATR Volatility)")
 
         if vol_ratio >= 1.25:
             total_score += 6
-            score_adjustments.append("+6 (Strong Volume Follow-Through)")
+            score_adjustments.append("+6 (Strong Volume)")
         elif vol_ratio < 0.7:
             total_score -= 5
             score_adjustments.append("-5 (Low Volume)")
@@ -408,10 +459,10 @@ def run_bat_engine(
         dist_pct = abs(cur_close - d_f) / max(abs(d_f), 1e-9) * 100.0
         if dist_pct <= 1.2:
             total_score += 5
-            score_adjustments.append("+5 (Close to Reversal Zone)")
+            score_adjustments.append("+5 (Near Optimal Zone)")
         elif dist_pct > 5.0:
             total_score -= 6
-            score_adjustments.append("-6 (Extended Distance to D)")
+            score_adjustments.append("-6 (Far From D)")
 
     total_score = int(max(0, min(100, total_score)))
 
@@ -449,7 +500,7 @@ def run_bat_engine(
         optimal_zone_low=optimal_zone_low,
         optimal_zone_high=optimal_zone_high,
         sl=None if np.isnan(price_sl) else float(price_sl),
-        suggested_sl=suggested_sl,
+        secondary_sl=secondary_sl,
         bias_change_level=bias_change_level,
         tp1=None if np.isnan(price_tp1) else float(price_tp1),
         tp2=None if np.isnan(price_tp2) else float(price_tp2),
@@ -471,12 +522,6 @@ def run_bat_engine(
 
 
 def enrich_multi_timeframe_context(results: List[BatScanResult]) -> List[BatScanResult]:
-    """
-    Evaluates higher-timeframe 'READY TO BE' or 'CONFIRMED' patterns for each coin:
-    - Same-direction HTF 'READY TO BE': price likely travels toward that HTF zone before reversing.
-    - Opposing HTF 'READY TO BE' (e.g. 1H bullish while 4H/1D bearish is forming): TPs on current
-      move may feed into forming the higher-timeframe setup—wait for optimal reversal zone.
-    """
     by_coin: Dict[str, Dict[str, BatScanResult]] = {}
     for r in results:
         by_coin.setdefault(r.coin, {})[r.timeframe] = r
@@ -495,14 +540,14 @@ def enrich_multi_timeframe_context(results: List[BatScanResult]) -> List[BatScan
             hr = tf_map[htf]
             if hr.status_label == "READY TO BE" and hr.pattern_type == r.pattern_type:
                 notes.append(
-                    f"{htf} {hr.pattern_type} is READY TO BE — price may drive toward {htf} reversal zone before turning."
+                    f"{htf} {hr.pattern_type} is READY TO BE — price may travel toward {htf} reversal zone before turning."
                 )
                 if r.status_label == "CONFIRMED":
                     adj += 5
                     r.score_adjustments.append(f"+5 ({htf} Same-Dir Forming)")
             elif hr.status_label == "READY TO BE" and hr.pattern_type != r.pattern_type and hr.pattern_type:
                 notes.append(
-                    f"{htf} {hr.pattern_type} is READY TO BE — current {r.pattern_type} move/TPs may build {htf} setup; avoid rushing entry."
+                    f"{htf} {hr.pattern_type} is READY TO BE — current {r.pattern_type} move/TPs may build {htf} setup; wait for optimal zone."
                 )
                 adj -= 7
                 r.score_adjustments.append(f"-7 ({htf} Opposing Forming)")
@@ -512,7 +557,7 @@ def enrich_multi_timeframe_context(results: List[BatScanResult]) -> List[BatScan
                 r.score_adjustments.append(f"+6 ({htf} Confirmed Alignment)")
 
         if not notes:
-            notes.append("Higher timeframes show no conflicting forming pattern; wait for optimal reversal zone.")
+            notes.append("No conflicting higher-timeframe forming pattern; wait for optimal reversal zone.")
 
         r.mtf_notes = notes
         r.total_score = int(max(0, min(100, adj)))
