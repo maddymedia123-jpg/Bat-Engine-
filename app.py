@@ -245,13 +245,15 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Live Scanning")
-    auto_refresh = st.checkbox("Smooth auto-refresh", value=True)
-    refresh_sec = st.slider("Refresh interval (sec)", min_value=20, max_value=180, value=60, step=10)
+    st.subheader("Live Scanning (Non-Blocking)")
+    # Default False so background timers never interrupt active work or freeze the page
+    auto_refresh = st.checkbox("Auto-update active monitor fragment", value=False)
+    refresh_sec = st.slider("Fragment update interval (sec)", min_value=15, max_value=180, value=30, step=5)
 
     st.divider()
     st.subheader("AI Agent Key (On-Demand Only)")
-    ai_api_key = st.text_input("AI API Key Override (Optional)", type="password", placeholder="sk-...")
+    ai_api_key_raw = st.text_input("AI API Key Override (Optional)", type="password", placeholder="sk-...")
+    ai_api_key = ai_api_key_raw.strip()
 
     st.divider()
     st.subheader("Display Options")
@@ -293,7 +295,7 @@ params = {
 }
 
 st.title("Harmonics Engine")
-st.caption("Pine v6 BatPattern engine on swap futures (defaulting to BTCUSDT.P) with ATR SL, price correlation display, Turso persistence, and on-demand AI agent.")
+st.caption("Pine v6 BatPattern engine on swap futures (defaulting to BTCUSDT.P) with ATR SL, price correlation display, Turso persistence, and non-blocking updates.")
 
 coins_list = [clean_coin_name(s) for s in symbols_list]
 last_price_by_coin: Dict[str, Optional[float]] = {}
@@ -389,7 +391,7 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
         setup_context=target_ctx,
         all_committed_trades=st.session_state.active_trades,
         audit_history=st.session_state.audit_logs,
-        api_key=ai_api_key,
+        api_key=ai_api_key or None,
     )
     st.session_state.ai_summaries[t_key] = t_summary
     save_summary(t_key, target_coin, target_tf, t_summary)
@@ -404,138 +406,148 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
             setup_context=tr,
             all_committed_trades=st.session_state.active_trades,
             audit_history=st.session_state.audit_logs,
-            api_key=ai_api_key,
+            api_key=ai_api_key or None,
         )
         st.session_state.ai_summaries[ckey] = csum
         save_summary(ckey, c, tf, csum)
 
 
-# 1. ACTIVE TRADE MONITORING TERMINAL
-st.subheader(f"Active Trade Monitoring Terminal ({len(st.session_state.active_trades)} / 10 Locked)")
-if st.session_state.active_trades:
-    tf_tabs = st.tabs(["All Active Trades"] + [f"Active {t} Trades" for t in selected_tfs])
-    for tab_idx, tab in enumerate(tf_tabs):
-        with tab:
-            subset = (
-                st.session_state.active_trades
-                if tab_idx == 0
-                else [t for t in st.session_state.active_trades if t["timeframe"] == selected_tfs[tab_idx - 1]]
-            )
-            if not subset:
-                st.info("No active trades in this filter.")
-                continue
+def _render_active_monitor_body() -> None:
+    st.subheader(f"Active Trade Monitoring Terminal ({len(st.session_state.active_trades)} / 10 Locked)")
+    if st.session_state.active_trades:
+        tf_tabs = st.tabs(["All Active Trades"] + [f"Active {t} Trades" for t in selected_tfs])
+        for tab_idx, tab in enumerate(tf_tabs):
+            with tab:
+                subset = (
+                    st.session_state.active_trades
+                    if tab_idx == 0
+                    else [t for t in st.session_state.active_trades if t["timeframe"] == selected_tfs[tab_idx - 1]]
+                )
+                if not subset:
+                    st.info("No active trades in this filter.")
+                    continue
 
-            for idx, trade in enumerate(subset):
-                coin = trade["coin"]
-                tf = trade["timeframe"]
-                direction = trade["pattern_type"]
-                live_p = trade.get("last_price")
-                entry_p = trade.get("entry_d")
-                sl_p = trade.get("sl")
-                tp1_p, tp2_p, tp3_p = trade.get("tp1"), trade.get("tp2"), trade.get("tp3")
-                sl_hit = bool(trade.get("sl_hit", False))
-                any_tp_hit = bool(trade.get("tp1_hit") or trade.get("tp2_hit") or trade.get("tp3_hit"))
-                tf_h = TF_HOURS.get(tf, 1.0)
-                liq_snap = fetch_liquidation_snapshot(coin, live_p)
-                s_key = f"{coin}_{tf}"
+                for idx, trade in enumerate(subset):
+                    coin = trade["coin"]
+                    tf = trade["timeframe"]
+                    direction = trade["pattern_type"]
+                    live_p = fetch_perp_last_price(to_perp_symbol(coin)) or trade.get("last_price")
+                    entry_p = trade.get("entry_d")
+                    sl_p = trade.get("sl")
+                    tp1_p, tp2_p, tp3_p = trade.get("tp1"), trade.get("tp2"), trade.get("tp3")
+                    sl_hit = bool(trade.get("sl_hit", False))
+                    any_tp_hit = bool(trade.get("tp1_hit") or trade.get("tp2_hit") or trade.get("tp3_hit"))
+                    tf_h = TF_HOURS.get(tf, 1.0)
+                    liq_snap = fetch_liquidation_snapshot(coin, live_p)
+                    s_key = f"{coin}_{tf}"
 
-                with st.container(border=True):
-                    c1, c2, c3, c4, c5 = st.columns([1.7, 1.9, 2.6, 2.0, 0.9])
-                    with c1:
-                        st.markdown(f"### {coin}USDT.P · `{tf}`")
-                        st.markdown(f"**{direction}** · `{trade.get('sig_code', 'C')}` ({trade.get('conf_pct', 0.0):.0f}%)")
-                        st.caption(f"Score: **{trade.get('total_score', 0)}/100**")
+                    with st.container(border=True):
+                        c1, c2, c3, c4, c5 = st.columns([1.7, 1.9, 2.6, 2.0, 0.9])
+                        with c1:
+                            st.markdown(f"### {coin}USDT.P · `{tf}`")
+                            st.markdown(f"**{direction}** · `{trade.get('sig_code', 'C')}` ({trade.get('conf_pct', 0.0):.0f}%)")
+                            st.caption(f"Score: **{trade.get('total_score', 0)}/100**")
 
-                    with c2:
-                        st.markdown(f"**Live:** {fmt_price(live_p)}")
-                        st.markdown(f"**Entry:** {fmt_price(entry_p)}")
-                        st.markdown(f"**ATR SL (Main):** {fmt_price(sl_p)}")
-                        st.caption(f"Secondary SL: {fmt_price(trade.get('secondary_sl'))}")
-                        st.caption(f"Bias-Change: {fmt_price(trade.get('bias_change_level'))}")
+                        with c2:
+                            st.markdown(f"**Live:** {fmt_price(live_p)}")
+                            st.markdown(f"**Entry:** {fmt_price(entry_p)}")
+                            st.markdown(f"**ATR SL (Main):** {fmt_price(sl_p)}")
+                            st.caption(f"Secondary SL: {fmt_price(trade.get('secondary_sl'))}")
+                            st.caption(f"Bias-Change: {fmt_price(trade.get('bias_change_level'))}")
 
-                    with c3:
-                        if sl_hit and not any_tp_hit:
-                            st.error("SL HIT — MONITORING FROZEN (TP bars cleared)")
-                        else:
-                            if sl_hit and any_tp_hit:
-                                tp_done = [
-                                    t
-                                    for t, flag in (
-                                        ("TP1", trade.get("tp1_hit")),
-                                        ("TP2", trade.get("tp2_hit")),
-                                        ("TP3", trade.get("tp3_hit")),
-                                    )
-                                    if flag
-                                ]
-                                st.warning(f"SL HIT AFTER {', '.join(tp_done)} — Keeping TP & SL status until killed.")
-
-                            for tp_label, tp_val, hit_flag, mult_h in (
-                                ("TP1", tp1_p, trade.get("tp1_hit", False), 4.0 * tf_h),
-                                ("TP2", tp2_p, trade.get("tp2_hit", False), 8.0 * tf_h),
-                                ("TP3", tp3_p, trade.get("tp3_hit", False), 16.0 * tf_h),
-                            ):
-                                prog = 100.0 if hit_flag else compute_tp_progress(live_p, entry_p, tp_val, sl_p, direction)
-                                eta_str = "HIT" if hit_flag else format_eta_pkt(mult_h * (1.0 - prog / 100.0))
-                                st.progress(int(round(prog)), text=f"{tp_label} ({fmt_price(tp_val)}): {prog:.0f}% · {eta_str}")
-
-                    with c4:
-                        if trade.get("beyond_optimal_entry"):
-                            st.warning(f"Beyond Optimal Entry: {trade.get('optimal_entry_status')}")
-                        else:
-                            st.caption(f"Entry Zone Status: {trade.get('optimal_entry_status')}")
-
-                        if trade.get("bad_confluences"):
-                            st.error("Confluence Warning: " + ", ".join(trade["bad_confluences"]))
-                        else:
-                            st.success("Confluences Intact")
-
-                        st.caption(f"Wall: {trade.get('tp_obstacle_note', 'Clear path')}")
-                        st.caption(f"Liq: {liq_snap.get('liq_note', '-')}")
-
-                    with c5:
-                        if st.button("Kill", key=f"kill_{tab_idx}_{idx}_{coin}_{tf}", use_container_width=True):
-                            st.session_state.active_trades = [
-                                t
-                                for t in st.session_state.active_trades
-                                if not (t["coin"] == coin and t["timeframe"] == tf and t["pattern_type"] == direction)
-                            ]
-                            save_active_trades(st.session_state.active_trades)
-                            st.rerun()
-
-                    has_sum = s_key in st.session_state.ai_summaries
-                    btn_lbl = "Re-run AI Summary (Committed Sync)" if has_sum else "Run AI Summary (On-Demand)"
-                    with st.expander(f"AI Trader Summary & Self-Audit — {coin} [{tf}]", expanded=False):
-                        b_col1, b_col2, b_col3 = st.columns([1.4, 1.2, 1.4])
-                        with b_col1:
-                            if st.button(btn_lbl, key=f"run_ai_tr_{tab_idx}_{idx}_{coin}_{tf}"):
-                                trigger_agent_for_committed_and_target(coin, tf, trade)
-                                st.rerun()
-                        with b_col2:
-                            toggle_vis = st.checkbox(
-                                "Show Summary Text",
-                                value=st.session_state.show_summary_toggle,
-                                key=f"tog_tr_{tab_idx}_{idx}_{coin}_{tf}",
-                            )
-                            st.session_state.show_summary_toggle = toggle_vis
-                        with b_col3:
-                            show_audit = st.checkbox("View Self-Audit Log", key=f"aud_tr_{tab_idx}_{idx}_{coin}_{tf}")
-
-                        if st.session_state.show_summary_toggle and has_sum:
-                            st.info(st.session_state.ai_summaries[s_key])
-                        elif not has_sum:
-                            st.caption("No summary run yet. Click **Run AI Summary** to generate & save in Turso.")
-
-                        if show_audit:
-                            if st.session_state.audit_logs:
-                                for a in st.session_state.audit_logs[:8]:
-                                    st.caption(
-                                        f"• [{a.get('audited_pkt')}] {a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
-                                        f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
-                                    )
+                        with c3:
+                            if sl_hit and not any_tp_hit:
+                                st.error("SL HIT — MONITORING FROZEN (TP bars cleared)")
                             else:
-                                st.caption("Self-audit log updates automatically whenever you run a summary.")
+                                if sl_hit and any_tp_hit:
+                                    tp_done = [
+                                        t
+                                        for t, flag in (
+                                            ("TP1", trade.get("tp1_hit")),
+                                            ("TP2", trade.get("tp2_hit")),
+                                            ("TP3", trade.get("tp3_hit")),
+                                        )
+                                        if flag
+                                    ]
+                                    st.warning(f"SL HIT AFTER {', '.join(tp_done)} — Keeping TP & SL status until killed.")
+
+                                for tp_label, tp_val, hit_flag, mult_h in (
+                                    ("TP1", tp1_p, trade.get("tp1_hit", False), 4.0 * tf_h),
+                                    ("TP2", tp2_p, trade.get("tp2_hit", False), 8.0 * tf_h),
+                                    ("TP3", tp3_p, trade.get("tp3_hit", False), 16.0 * tf_h),
+                                ):
+                                    prog = 100.0 if hit_flag else compute_tp_progress(live_p, entry_p, tp_val, sl_p, direction)
+                                    eta_str = "HIT" if hit_flag else format_eta_pkt(mult_h * (1.0 - prog / 100.0))
+                                    st.progress(int(round(prog)), text=f"{tp_label} ({fmt_price(tp_val)}): {prog:.0f}% · {eta_str}")
+
+                        with c4:
+                            if trade.get("beyond_optimal_entry"):
+                                st.warning(f"Beyond Optimal Entry: {trade.get('optimal_entry_status')}")
+                            else:
+                                st.caption(f"Entry Zone Status: {trade.get('optimal_entry_status')}")
+
+                            if trade.get("bad_confluences"):
+                                st.error("Confluence Warning: " + ", ".join(trade["bad_confluences"]))
+                            else:
+                                st.success("Confluences Intact")
+
+                            st.caption(f"Wall: {trade.get('tp_obstacle_note', 'Clear path')}")
+                            st.caption(f"Liq: {liq_snap.get('liq_note', '-')}")
+
+                        with c5:
+                            if st.button("Kill", key=f"kill_{tab_idx}_{idx}_{coin}_{tf}", use_container_width=True):
+                                st.session_state.active_trades = [
+                                    t
+                                    for t in st.session_state.active_trades
+                                    if not (t["coin"] == coin and t["timeframe"] == tf and t["pattern_type"] == direction)
+                                ]
+                                save_active_trades(st.session_state.active_trades)
+                                st.rerun()
+
+                        has_sum = s_key in st.session_state.ai_summaries
+                        btn_lbl = "Re-run AI Summary (Committed Sync)" if has_sum else "Run AI Summary (On-Demand)"
+                        with st.expander(f"AI Trader Summary & Self-Audit — {coin} [{tf}]", expanded=False):
+                            b_col1, b_col2, b_col3 = st.columns([1.4, 1.2, 1.4])
+                            with b_col1:
+                                if st.button(btn_lbl, key=f"run_ai_tr_{tab_idx}_{idx}_{coin}_{tf}"):
+                                    trigger_agent_for_committed_and_target(coin, tf, trade)
+                                    st.rerun()
+                            with b_col2:
+                                toggle_vis = st.checkbox(
+                                    "Show Summary Text",
+                                    value=st.session_state.show_summary_toggle,
+                                    key=f"tog_tr_{tab_idx}_{idx}_{coin}_{tf}",
+                                )
+                                st.session_state.show_summary_toggle = toggle_vis
+                            with b_col3:
+                                show_audit = st.checkbox("View Self-Audit Log", key=f"aud_tr_{tab_idx}_{idx}_{coin}_{tf}")
+
+                            if st.session_state.show_summary_toggle and has_sum:
+                                st.info(st.session_state.ai_summaries[s_key])
+                            elif not has_sum:
+                                st.caption("No summary run yet. Click **Run AI Summary** to generate & save in Turso.")
+
+                            if show_audit:
+                                if st.session_state.audit_logs:
+                                    for a in st.session_state.audit_logs[:8]:
+                                        st.caption(
+                                            f"• [{a.get('audited_pkt')}] {a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
+                                            f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
+                                        )
+                                else:
+                                    st.caption("Self-audit log updates automatically whenever you run a summary.")
+    else:
+        st.info("No active trades locked yet. Lock a CONFIRMED signal from the Bat Pattern tab below.")
+
+
+if auto_refresh and hasattr(st, "fragment"):
+    @st.fragment(run_every=int(refresh_sec))
+    def _live_monitor_fragment() -> None:
+        _render_active_monitor_body()
+
+    _live_monitor_fragment()
 else:
-    st.info("No active trades locked yet. Lock a CONFIRMED signal from the Bat Pattern tab below.")
+    _render_active_monitor_body()
 
 # 2. PATTERN TABS
 st.divider()
@@ -717,7 +729,7 @@ with detail_tabs[0]:
 
         if st.session_state.show_summary_toggle and has_csum:
             st.info(st.session_state.ai_summaries[c_key])
-        elif not has_csum:
+        elif not has_sum:
             st.caption("Click **Run AI Summary** to generate a layman institutional opinion and sync across committed trades.")
 
         if show_chart_audit:
@@ -792,9 +804,3 @@ for tab, horizon in zip(log_tabs, HORIZONS):
                 )
         else:
             st.info("No logged signals for this window yet.")
-
-if auto_refresh:
-    components.html(
-        f"<script>setTimeout(function(){{ window.parent.location.reload(); }}, {int(refresh_sec) * 1000});</script>",
-        height=0,
-    )
