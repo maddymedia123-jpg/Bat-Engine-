@@ -1,53 +1,124 @@
-trades_changed = False
-for trade in st.session_state.active_trades:
-    coin = trade["coin"]
-    tf = trade["timeframe"]
-    direction = trade["pattern_type"]
-    live_price = last_price_by_coin.get(coin)
-    if live_price is None:
-        live_price = trade.get("last_price")
-    trade["last_price"] = live_price
+from __future__ import annotations
 
-    latest_scan = result_map.get((coin, tf))
-    if latest_scan:
-        trade["conf_score"] = latest_scan.conf_score
-        trade["conf_pct"] = latest_scan.conf_pct
-        trade["total_score"] = latest_scan.total_score
-        trade["bad_confluences"] = latest_scan.bad_confluences
-        trade["beyond_optimal_entry"] = latest_scan.beyond_optimal_entry
-        trade["optimal_entry_status"] = latest_scan.optimal_entry_status
-        trade["secondary_sl"] = latest_scan.secondary_sl
-        trade["bias_change_level"] = latest_scan.bias_change_level
-        trade["mtf_notes"] = latest_scan.mtf_notes
-        trade["tp_obstacle_note"] = latest_scan.tp_obstacle_note
+from typing import Dict, List, Optional
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
 
-    if live_price is not None and not trade.get("sl_hit", False):
-        if direction == "BULLISH":
-            if trade.get("tp1") is not None and live_price >= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                trades_changed = True
-            if trade.get("tp2") is not None and live_price >= trade["tp2"] and not trade.get("tp2_hit"):
-                trade["tp2_hit"] = True
-                trades_changed = True
-            if trade.get("tp3") is not None and live_price >= trade["tp3"] and not trade.get("tp3_hit"):
-                trade["tp3_hit"] = True
-                trades_changed = True
-            if trade.get("sl") is not None and live_price <= trade["sl"]:
-                trade["sl_hit"] = True
-                trades_changed = True
-        else:
-            if trade.get("tp1") is not None and live_price <= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                trades_changed = True
-            if trade.get("tp2") is not None and live_price <= trade["tp2"] and not trade.get("tp2_hit"):
-                trade["tp2_hit"] = True
-                trades_changed = True
-            if trade.get("tp3") is not None and live_price <= trade["tp3"] and not trade.get("tp3_hit"):
-                trade["tp3_hit"] = True
-                trades_changed = True
-            if trade.get("sl") is not None and live_price >= trade["sl"]:
-                trade["sl_hit"] = True
-                trades_changed = True
+from bat_engine import BatScanResult, enrich_multi_timeframe_context, run_bat_engine
+from market_data import (
+    DEFAULT_PERP_SYMBOLS,
+    TF_HOURS,
+    TIMEFRAME_OPTIONS,
+    TV_INTERVAL_MAP,
+    clean_coin_name,
+    fetch_liquidation_snapshot,
+    fetch_perp_klines,
+    fetch_perp_last_price,
+    format_eta_pkt,
+    to_perp_symbol,
+)
+from turso_store import (
+    HORIZONS,
+    filter_logbook_records,
+    init_storage,
+    load_active_trades,
+    load_audit_logs,
+    load_logbook,
+    load_saved_summaries,
+    record_generated_signals,
+    run_on_demand_trader_agent,
+    save_active_trades,
+    save_summary,
+    silent_self_audit_and_update,
+    turso_configured,
+)
 
-if trades_changed:
-    save_active_trades(st.session_state.active_trades)
+st.set_page_config(page_title="Harmonics Engine — Bat Pattern", layout="wide")
+
+
+def fmt_price(val: Optional[float]) -> str:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return "-"
+    return f"${val:.6f}".rstrip("0").rstrip(".")
+
+
+def compute_tp_progress(
+    live_price: Optional[float],
+    entry: Optional[float],
+    tp: Optional[float],
+    sl: Optional[float],
+    direction: str,
+) -> float:
+    if live_price is None or entry is None or tp is None or tp == entry:
+        return 0.0
+    if direction == "BULLISH":
+        if sl is not None and live_price <= sl:
+            return 0.0
+        pct = ((live_price - entry) / (tp - entry)) * 100.0
+    else:
+        if sl is not None and live_price >= sl:
+            return 0.0
+        pct = ((entry - live_price) / (entry - tp)) * 100.0
+    return float(max(0.0, min(100.0, pct)))
+
+
+def render_tradingview_chart(tv_symbol: str, tf_label: str, height: int = 430) -> None:
+    interval = TV_INTERVAL_MAP.get(tf_label, "60")
+    html = f"""
+    <div class="tradingview-widget-container">
+      <div id="tv_harmonics_chart"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+        new TradingView.widget({{
+          "width": "100%",
+          "height": {height},
+          "symbol": "{tv_symbol}",
+          "interval": "{interval}",
+          "timezone": "Asia/Karachi",
+          "theme": "dark",
+          "style": "1",
+          "locale": "en",
+          "toolbar_bg": "#1a2027",
+          "enable_publishing": false,
+          "allow_symbol_change": true,
+          "container_id": "tv_harmonics_chart"
+        }});
+      </script>
+    </div>
+    """
+    components.html(html, height=height + 16)
+
+
+def render_pattern_mapping_chart(
+    df: pd.DataFrame,
+    res: BatScanResult,
+    liq_info: Dict[str, Optional[float] | str],
+) -> go.Figure:
+    fig = go.Figure()
+    if df is None or df.empty:
+        fig.update_layout(template="plotly_dark", height=430, margin=dict(l=10, r=10, t=30, b=10))
+        return fig
+
+    plot_df = df.tail(120).copy()
+    offset = len(df) - len(plot_df)
+    x_vals = list(range(len(plot_df)))
+
+    fig.add_trace(
+        go.Candlestick(
+            x=x_vals,
+            open=plot_df["open"],
+            high=plot_df["high"],
+            low=plot_df["low"],
+            close=plot_df["close"],
+            name=f"{res.coin} {res.timeframe}",
+        )
+    )
+
+    if res.pivots and all(k in res.pivots for k in ("X", "A", "B", "C")):
+        px_i, px_v = res.pivots["X"][0] - offset, res.pivots["X"][1]
+        pa_i, pa_v = res.pivots["A"][0] - offset, res.pivots["A"][1]
+        pb_i, pb_v = res.pivots["B"][0] - offset, res.pivots["B"][1]
+        pc_i, pc_v = res.pivots["C"][0] - offset, res.pivots["C"][1]
