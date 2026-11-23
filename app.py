@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
@@ -9,7 +8,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from bat_engine import BatScanResult, enrich_multi_timeframe_context, run_bat_engine
-from logbook import HORIZONS, filter_logbook_records, load_logbook, record_generated_signals
 from market_data import (
     DEFAULT_20_SYMBOLS,
     TF_HOURS,
@@ -22,8 +20,22 @@ from market_data import (
     fetch_liquidation_snapshot,
     fetch_web_reference_prices,
     format_eta_pkt,
-    generate_layman_ai_summary,
     to_kucoin_symbol,
+)
+from turso_store import (
+    HORIZONS,
+    filter_logbook_records,
+    init_storage,
+    load_active_trades,
+    load_audit_logs,
+    load_logbook,
+    load_saved_summaries,
+    record_generated_signals,
+    run_on_demand_trader_agent,
+    save_active_trades,
+    save_summary,
+    silent_self_audit_and_update,
+    turso_configured,
 )
 
 st.set_page_config(page_title="Harmonics Engine — Bat Pattern", layout="wide")
@@ -161,9 +173,9 @@ def render_pattern_mapping_chart(
     if res.entry_d is not None:
         fig.add_hline(y=res.entry_d * scale, line_dash="dash", line_color="#FFD54F", annotation_text="Entry (D)")
     if res.sl is not None:
-        fig.add_hline(y=res.sl * scale, line_dash="solid", line_color="#FF3B3B", annotation_text="Primary SL")
-    if res.suggested_sl is not None:
-        fig.add_hline(y=res.suggested_sl * scale, line_dash="dashdot", line_color="#FF9800", annotation_text="Wick-Buffer SL")
+        fig.add_hline(y=res.sl * scale, line_dash="solid", line_color="#FF3B3B", annotation_text="ATR SL")
+    if res.secondary_sl is not None:
+        fig.add_hline(y=res.secondary_sl * scale, line_dash="dashdot", line_color="#FF9800", annotation_text="Secondary SL")
     if res.bias_change_level is not None:
         fig.add_hline(y=res.bias_change_level * scale, line_dash="longdash", line_color="#AB47BC", annotation_text="Bias-Change")
     if res.nearest_support is not None:
@@ -192,17 +204,26 @@ def render_pattern_mapping_chart(
     return fig
 
 
+# Initialize persistent storage & session state once
+if "storage_ready" not in st.session_state:
+    init_storage()
+    st.session_state.storage_ready = True
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = list(DEFAULT_20_SYMBOLS)
 if "active_trades" not in st.session_state:
-    st.session_state.active_trades = []
+    st.session_state.active_trades = load_active_trades()
 if "logbook" not in st.session_state:
     st.session_state.logbook = load_logbook()
 if "ai_summaries" not in st.session_state:
-    st.session_state.ai_summaries = {}
+    st.session_state.ai_summaries = load_saved_summaries()
+if "audit_logs" not in st.session_state:
+    st.session_state.audit_logs = load_audit_logs()
+if "show_summary_toggle" not in st.session_state:
+    st.session_state.show_summary_toggle = True
 
 with st.sidebar:
     st.header("Watchlist & Timeframes (20+ Coins)")
+    st.caption(f"Turso Cloud: {'Connected' if turso_configured() else 'Local Fallback (Add Secrets for Turso)'}")
 
     add_col, del_col = st.columns(2)
     with add_col:
@@ -228,18 +249,21 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Background Live Scanning")
-    auto_refresh = st.checkbox("Auto-refresh continuously", value=True)
-    refresh_sec = st.slider("Refresh interval (sec)", min_value=15, max_value=180, value=45, step=15)
+    auto_refresh = st.checkbox("Smooth auto-refresh", value=True)
+    refresh_sec = st.slider("Refresh interval (sec)", min_value=20, max_value=180, value=60, step=10)
 
     st.divider()
-    st.subheader("Display & AI Summary")
+    st.subheader("AI Agent Key (On-Demand Only)")
+    ai_api_key = st.text_input("AI API Key (Optional)", type="password", placeholder="sk-...")
+
+    st.divider()
+    st.subheader("Display Options")
     price_mode = st.radio(
         "Display levels in:",
         options=["KuCoin Native", "Web / Reference Adjusted"],
         index=0,
     )
     show_overstretched = st.checkbox("Show overstretched READY TO BE (W) rows", value=False)
-    ai_api_key = st.text_input("AI API Key (Optional)", type="password", placeholder="sk-...")
 
     with st.expander("Pine Bat Engine Parameters"):
         pivot_left = st.number_input("Pivot Left Strength", min_value=1, max_value=20, value=4)
@@ -277,7 +301,7 @@ params = {
 }
 
 st.title("Harmonics Engine")
-st.caption("Multi-timeframe harmonic scanner with Bat Pattern tab, active trade tracking (PKT), stacked charts, and backtest logbook.")
+st.caption("Pine-aligned Bat scanner with ATR primary SL, secondary trailing SL, Turso cloud persistence, and on-demand institutional AI agent.")
 
 coins_tuple = tuple(clean_coin_name(s) for s in symbols_list)
 web_prices = fetch_web_reference_prices(coins_tuple)
@@ -310,10 +334,10 @@ for tf in selected_tfs:
 
 results = enrich_multi_timeframe_context(results)
 st.session_state.logbook = record_generated_signals(st.session_state.logbook, results)
-
 result_map: Dict[tuple, BatScanResult] = {(r.coin, r.timeframe): r for r in results}
 
-# Update active locked trades live
+# Update active locked trades live & persist to Turso
+trades_changed = False
 for trade in st.session_state.active_trades:
     coin = trade["coin"]
     tf = trade["timeframe"]
@@ -331,30 +355,83 @@ for trade in st.session_state.active_trades:
         trade["bad_confluences"] = latest_scan.bad_confluences
         trade["beyond_optimal_entry"] = latest_scan.beyond_optimal_entry
         trade["optimal_entry_status"] = latest_scan.optimal_entry_status
-        trade["suggested_sl"] = latest_scan.suggested_sl
+        trade["secondary_sl"] = latest_scan.secondary_sl
         trade["bias_change_level"] = latest_scan.bias_change_level
         trade["mtf_notes"] = latest_scan.mtf_notes
         trade["tp_obstacle_note"] = latest_scan.tp_obstacle_note
 
     if live_price is not None and not trade.get("sl_hit", False):
         if direction == "BULLISH":
-            if trade.get("tp1") is not None and live_price >= trade["tp1"]:
+            if trade.get("tp1") is not None and live_price >= trade["tp1"] and not trade.get("tp1_hit"):
                 trade["tp1_hit"] = True
-            if trade.get("tp2") is not None and live_price >= trade["tp2"]:
+                trades_changed = True
+            if trade.get("tp2") is not None and live_price >= trade["tp2"] and not trade.get("tp2_hit"):
                 trade["tp2_hit"] = True
-            if trade.get("tp3") is not None and live_price >= trade["tp3"]:
+                trades_changed = True
+            if trade.get("tp3") is not None and live_price >= trade["tp3"] and not trade.get("tp3_hit"):
                 trade["tp3_hit"] = True
+                trades_changed = True
             if trade.get("sl") is not None and live_price <= trade["sl"]:
                 trade["sl_hit"] = True
+                trades_changed = True
         else:
-            if trade.get("tp1") is not None and live_price <= trade["tp1"]:
+            if trade.get("tp1") is not None and live_price <= trade["tp1"] and not trade.get("tp1_hit"):
                 trade["tp1_hit"] = True
-            if trade.get("tp2") is not None and live_price <= trade["tp2"]:
+                trades_changed = True
+            if trade.get("tp2") is not None and live_price <= trade["tp2"] and not trade.get("tp2_hit"):
                 trade["tp2_hit"] = True
-            if trade.get("tp3") is not None and live_price <= trade["tp3"]:
+                trades_changed = True
+            if trade.get("tp3") is not None and live_price <= trade["tp3"] and not trade.get("tp3_hit"):
                 trade["tp3_hit"] = True
+                trades_changed = True
             if trade.get("sl") is not None and live_price >= trade["sl"]:
                 trade["sl_hit"] = True
+                trades_changed = True
+
+if trades_changed:
+    save_active_trades(st.session_state.active_trades)
+
+
+def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, target_ctx: Dict[str, object]) -> None:
+    """
+    Runs ONLY when the user clicks Run / Re-run Summary. Silently audits & updates
+    agent memory, and refreshes summaries across committed trades and the target chart setup.
+    """
+    st.session_state.audit_logs = silent_self_audit_and_update(
+        st.session_state.audit_logs,
+        st.session_state.active_trades,
+        st.session_state.logbook,
+    )
+
+    # Update target setup summary
+    t_key = f"{target_coin}_{target_tf}"
+    t_summary = run_on_demand_trader_agent(
+        target_coin=target_coin,
+        target_tf=target_tf,
+        setup_context=target_ctx,
+        all_committed_trades=st.session_state.active_trades,
+        audit_history=st.session_state.audit_logs,
+        api_key=ai_api_key,
+    )
+    st.session_state.ai_summaries[t_key] = t_summary
+    save_summary(t_key, target_coin, target_tf, t_summary)
+
+    # Simultaneously update summaries for all committed active trades
+    for tr in st.session_state.active_trades:
+        c = tr.get("coin", "")
+        tf = tr.get("timeframe", "")
+        ckey = f"{c}_{tf}"
+        csum = run_on_demand_trader_agent(
+            target_coin=c,
+            target_tf=tf,
+            setup_context=tr,
+            all_committed_trades=st.session_state.active_trades,
+            audit_history=st.session_state.audit_logs,
+            api_key=ai_api_key,
+        )
+        st.session_state.ai_summaries[ckey] = csum
+        save_summary(ckey, c, tf, csum)
+
 
 # 1. ACTIVE TRADE MONITORING TERMINAL (Always visible)
 st.subheader(f"Active Trade Monitoring Terminal ({len(st.session_state.active_trades)} / 10 Locked)")
@@ -383,9 +460,10 @@ if st.session_state.active_trades:
                 any_tp_hit = bool(trade.get("tp1_hit") or trade.get("tp2_hit") or trade.get("tp3_hit"))
                 tf_h = TF_HOURS.get(tf, 1.0)
                 liq_snap = fetch_liquidation_snapshot(coin, live_p)
+                s_key = f"{coin}_{tf}"
 
                 with st.container(border=True):
-                    c1, c2, c3, c4, c5 = st.columns([1.8, 1.8, 2.6, 2.0, 0.9])
+                    c1, c2, c3, c4, c5 = st.columns([1.7, 1.9, 2.6, 2.0, 0.9])
                     with c1:
                         st.markdown(f"### {coin}/USDT · `{tf}`")
                         st.markdown(f"**{direction}** · `{trade.get('sig_code', 'C')}` ({trade.get('conf_pct', 0.0):.0f}%)")
@@ -394,8 +472,8 @@ if st.session_state.active_trades:
                     with c2:
                         st.markdown(f"**Live:** {fmt_price(live_p)}")
                         st.markdown(f"**Entry:** {fmt_price(entry_p)}")
-                        st.markdown(f"**Primary SL:** {fmt_price(sl_p)}")
-                        st.caption(f"Wick-Buf SL: {fmt_price(trade.get('suggested_sl'))}")
+                        st.markdown(f"**ATR SL (Main):** {fmt_price(sl_p)}")
+                        st.caption(f"Secondary SL: {fmt_price(trade.get('secondary_sl'))}")
                         st.caption(f"Bias-Change: {fmt_price(trade.get('bias_change_level'))}")
 
                     with c3:
@@ -434,7 +512,7 @@ if st.session_state.active_trades:
                         else:
                             st.success("Confluences Intact")
 
-                        st.caption(f"TP Wall: {trade.get('tp_obstacle_note', 'Clear path')}")
+                        st.caption(f"Wall: {trade.get('tp_obstacle_note', 'Clear path')}")
                         st.caption(f"Liq: {liq_snap.get('liq_note', '-')}")
 
                     with c5:
@@ -444,7 +522,42 @@ if st.session_state.active_trades:
                                 for t in st.session_state.active_trades
                                 if not (t["coin"] == coin and t["timeframe"] == tf and t["pattern_type"] == direction)
                             ]
+                            save_active_trades(st.session_state.active_trades)
                             st.rerun()
+
+                    # Collapsible on-demand AI agent summary + toggle + self-audit log
+                    has_sum = s_key in st.session_state.ai_summaries
+                    btn_lbl = "Re-run AI Summary (Committed Sync)" if has_sum else "Run AI Summary (On-Demand)"
+                    with st.expander(f"AI Trader Summary & Self-Audit — {coin} [{tf}]", expanded=False):
+                        b_col1, b_col2, b_col3 = st.columns([1.4, 1.2, 1.4])
+                        with b_col1:
+                            if st.button(btn_lbl, key=f"run_ai_tr_{tab_idx}_{idx}_{coin}_{tf}"):
+                                trigger_agent_for_committed_and_target(coin, tf, trade)
+                                st.rerun()
+                        with b_col2:
+                            toggle_vis = st.checkbox(
+                                "Show Summary Text",
+                                value=st.session_state.show_summary_toggle,
+                                key=f"tog_tr_{tab_idx}_{idx}_{coin}_{tf}",
+                            )
+                            st.session_state.show_summary_toggle = toggle_vis
+                        with b_col3:
+                            show_audit = st.checkbox("View Self-Audit Log", key=f"aud_tr_{tab_idx}_{idx}_{coin}_{tf}")
+
+                        if st.session_state.show_summary_toggle and has_sum:
+                            st.info(st.session_state.ai_summaries[s_key])
+                        elif not has_sum:
+                            st.caption("No summary run yet. Click **Run AI Summary** to generate & save in Turso.")
+
+                        if show_audit:
+                            if st.session_state.audit_logs:
+                                for a in st.session_state.audit_logs[:8]:
+                                    st.caption(
+                                        f"• [{a.get('audited_pkt')}] {a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
+                                        f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
+                                    )
+                            else:
+                                st.caption("Self-audit log updates automatically whenever you run a summary.")
 else:
     st.info("No active trades locked yet. Lock a CONFIRMED signal from the Bat Pattern tab below.")
 
@@ -480,7 +593,7 @@ with pattern_tabs[0]:
                 )
                 st.markdown(
                     f"**Entry (D):** `{fmt_price(r.entry_d, scale)}` · "
-                    f"**SL:** `{fmt_price(r.sl, scale)}` · "
+                    f"**ATR SL:** `{fmt_price(r.sl, scale)}` · "
                     f"**TP1:** `{fmt_price(r.tp1, scale)}` · "
                     f"**TP2/3:** `{fmt_price(r.tp2, scale)} / {fmt_price(r.tp3, scale)}`"
                 )
@@ -490,9 +603,9 @@ with pattern_tabs[0]:
                         f"Optimal Zone: {fmt_price(r.optimal_zone_low, scale)} – {fmt_price(r.optimal_zone_high, scale)}"
                     )
                 st.caption(
+                    f"Secondary SL: {fmt_price(r.secondary_sl, scale)} | "
                     f"Support: {fmt_price(r.nearest_support, scale)} | "
-                    f"Resistance: {fmt_price(r.nearest_resistance, scale)} | "
-                    f"{r.tp_obstacle_note}"
+                    f"Resistance: {fmt_price(r.nearest_resistance, scale)} | {r.tp_obstacle_note}"
                 )
                 for n in r.mtf_notes:
                     st.caption(f"• {n}")
@@ -523,7 +636,7 @@ with pattern_tabs[0]:
                                     "optimal_entry_status": r.optimal_entry_status,
                                     "entry_d": r.entry_d,
                                     "sl": r.sl,
-                                    "suggested_sl": r.suggested_sl,
+                                    "secondary_sl": r.secondary_sl,
                                     "bias_change_level": r.bias_change_level,
                                     "tp1": r.tp1,
                                     "tp2": r.tp2,
@@ -537,6 +650,7 @@ with pattern_tabs[0]:
                                     "last_price": corr_by_coin[r.coin]["kucoin"] or r.last_close,
                                 }
                             )
+                            save_active_trades(st.session_state.active_trades)
                             st.rerun()
 
     with col_ready:
@@ -548,7 +662,7 @@ with pattern_tabs[0]:
 with pattern_tabs[1]:
     st.info("Additional harmonic patterns will appear in their own tabs here as we add them.")
 
-# 3. STACKED CHARTS (TradingView up, Harmonic/Zone/Wall chart down) + Bullet Data & AI Summary
+# 3. STACKED CHARTS (TradingView up, Harmonic/Zone/Wall chart down) + On-Demand AI & Bullet Readout
 st.divider()
 st.subheader("Chart & Setup Inspector")
 
@@ -577,54 +691,78 @@ st.markdown("**1. Live TradingView Chart**")
 tv_sym = f"KUCOIN:{to_kucoin_symbol(chart_coin).replace('-', '')}"
 render_tradingview_chart(tv_sym, chart_tf, height=430)
 
-st.markdown("**2. Harmonic Legs, Reversal Zone, Support/Resistance & Liquidation Chart**")
+st.markdown("**2. Harmonic Legs, Reversal Zone, ATR SL & Support/Resistance Chart**")
 if selected_scan:
     st.plotly_chart(
         render_pattern_mapping_chart(selected_df, selected_scan, liq_info, chart_scale),
         use_container_width=True,
     )
 
-# Bullet-point readout & AI Layman Summary
-detail_tabs = st.tabs(["Data in Bullet Points", "AI Layman Opinion"])
+detail_tabs = st.tabs(["AI Layman Opinion & Self-Audit", "Data in Bullet Points"])
 
 with detail_tabs[0]:
     if selected_scan:
+        c_key = f"{selected_scan.coin}_{selected_scan.timeframe}"
+        has_csum = c_key in st.session_state.ai_summaries
+        a_col1, a_col2, a_col3 = st.columns([1.5, 1.2, 1.3])
+        with a_col1:
+            if st.button(
+                "Re-run AI Summary (Sync Committed)" if has_csum else "Run AI Summary (On-Demand)",
+                key="btn_chart_ai_agent",
+            ):
+                ctx_payload = {
+                    "coin": selected_scan.coin,
+                    "timeframe": selected_scan.timeframe,
+                    "pattern_type": selected_scan.pattern_type,
+                    "status_label": selected_scan.status_label,
+                    "conf_pct": selected_scan.conf_pct,
+                    "total_score": selected_scan.total_score,
+                    "entry_d": selected_scan.entry_d,
+                    "sl": selected_scan.sl,
+                    "secondary_sl": selected_scan.secondary_sl,
+                    "bias_change_level": selected_scan.bias_change_level,
+                    "tp_obstacle_note": selected_scan.tp_obstacle_note,
+                    "mtf_notes": selected_scan.mtf_notes,
+                }
+                trigger_agent_for_committed_and_target(selected_scan.coin, selected_scan.timeframe, ctx_payload)
+                st.rerun()
+        with a_col2:
+            st.session_state.show_summary_toggle = st.checkbox(
+                "Show Summary Text",
+                value=st.session_state.show_summary_toggle,
+                key="chk_chart_sum_toggle",
+            )
+        with a_col3:
+            show_chart_audit = st.checkbox("View Self-Audit Log", key="chk_chart_audit_toggle")
+
+        if st.session_state.show_summary_toggle and has_csum:
+            st.info(st.session_state.ai_summaries[c_key])
+        elif not has_csum:
+            st.caption("Click **Run AI Summary** to generate a layman institutional opinion and sync across committed trades.")
+
+        if show_chart_audit:
+            if st.session_state.audit_logs:
+                for a in st.session_state.audit_logs[:8]:
+                    st.caption(
+                        f"• [{a.get('audited_pkt')}] {a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
+                        f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
+                    )
+            else:
+                st.caption("No self-audit records yet.")
+
+with detail_tabs[1]:
+    if selected_scan:
         bullets = [
             f"Coin & Timeframe: {selected_scan.coin}/USDT on {selected_scan.timeframe} ({selected_scan.pattern_type or 'NONE'} — {selected_scan.status_label})",
-            f"Signal & Confluence: {selected_scan.sig_code} | Confluence {selected_scan.conf_pct:.1f}% ({selected_scan.conf_score}/3) | Total Score {selected_scan.total_score}/100",
+            f"Signal & Score: {selected_scan.sig_code} | Confluence {selected_scan.conf_pct:.1f}% ({selected_scan.conf_score}/3) | Total Score {selected_scan.total_score}/100",
             f"Entry (D): {fmt_price(selected_scan.entry_d, chart_scale)} | Optimal Zone: {fmt_price(selected_scan.optimal_zone_low, chart_scale)} – {fmt_price(selected_scan.optimal_zone_high, chart_scale)} ({selected_scan.optimal_entry_status})",
-            f"Risk Levels: Primary SL {fmt_price(selected_scan.sl, chart_scale)} | Wick-Buffer SL {fmt_price(selected_scan.suggested_sl, chart_scale)} | Bias-Change {fmt_price(selected_scan.bias_change_level, chart_scale)}",
+            f"Stop Levels: Primary ATR SL {fmt_price(selected_scan.sl, chart_scale)} | Secondary SL {fmt_price(selected_scan.secondary_sl, chart_scale)} | Bias-Change {fmt_price(selected_scan.bias_change_level, chart_scale)}",
             f"Targets: TP1 {fmt_price(selected_scan.tp1, chart_scale)} | TP2 {fmt_price(selected_scan.tp2, chart_scale)} | TP3 {fmt_price(selected_scan.tp3, chart_scale)}",
             f"Walls & Obstacles: Support {fmt_price(selected_scan.nearest_support, chart_scale)} | Resistance {fmt_price(selected_scan.nearest_resistance, chart_scale)} | {selected_scan.tp_obstacle_note}",
             f"Score Adjustments: {', '.join(selected_scan.score_adjustments) if selected_scan.score_adjustments else 'None'}",
         ] + [f"MTF Note: {m}" for m in selected_scan.mtf_notes]
         for b in bullets:
             st.markdown(f"* {b}")
-
-with detail_tabs[1]:
-    if selected_scan:
-        summary_key = f"{selected_scan.coin}_{selected_scan.timeframe}_{selected_scan.pattern_type}_{selected_scan.status_label}_{selected_scan.total_score}"
-        if st.button("Generate Layman Summary", key="btn_layman_ai"):
-            payload = {
-                "coin": selected_scan.coin,
-                "timeframe": selected_scan.timeframe,
-                "pattern_type": selected_scan.pattern_type,
-                "status_label": selected_scan.status_label,
-                "conf_pct": selected_scan.conf_pct,
-                "total_score": selected_scan.total_score,
-                "entry_d": selected_scan.entry_d,
-                "sl": selected_scan.sl,
-                "suggested_sl": selected_scan.suggested_sl,
-                "bias_change_level": selected_scan.bias_change_level,
-                "tp_obstacle_note": selected_scan.tp_obstacle_note,
-                "notes": selected_scan.mtf_notes,
-            }
-            st.session_state.ai_summaries[summary_key] = generate_layman_ai_summary(payload, ai_api_key)
-
-        if summary_key in st.session_state.ai_summaries:
-            st.info(st.session_state.ai_summaries[summary_key])
-        else:
-            st.caption("Click **Generate Layman Summary** to get a plain-language trade opinion (uses your AI key if entered in the sidebar).")
 
 # 4. STATUS TABLE & SIGNAL AUDIT LOGBOOK
 st.divider()
@@ -669,12 +807,15 @@ for tab, horizon in zip(log_tabs, HORIZONS):
                     f"**#{i} | {r.get('coin')}USDT [{r.get('timeframe')}] {r.get('pattern_type')}** — "
                     f"Outcome: `{r.get('outcome', 'TRACKING')}` · Stage: `{r.get('status_label')}` · "
                     f"Score: `{r.get('total_score', 0)}/100` · Logged: `{r.get('timestamp_pkt')}`  \n"
-                    f"Entry: `{fmt_price(r.get('entry_d'))}` | SL: `{fmt_price(r.get('sl'))}` | "
+                    f"Entry: `{fmt_price(r.get('entry_d'))}` | ATR SL: `{fmt_price(r.get('sl'))}` | "
                     f"TP1: `{fmt_price(r.get('tp1'))}` | TP2: `{fmt_price(r.get('tp2'))}` | TP3: `{fmt_price(r.get('tp3'))}`"
                 )
         else:
             st.info("No logged signals for this window yet.")
 
+# Non-blocking lightweight auto-refresh via meta refresh (avoids time.sleep freeze)
 if auto_refresh:
-    time.sleep(int(refresh_sec))
-    st.rerun()
+    components.html(
+        f"<script>setTimeout(function(){{ window.parent.location.reload(); }}, {int(refresh_sec) * 1000});</script>",
+        height=0,
+    )
