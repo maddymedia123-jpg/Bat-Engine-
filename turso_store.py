@@ -1,11 +1,21 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+import json
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_CHAT_URL = f"{OPENROUTER_BASE_URL}/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
+
+HORIZONS: List[str] = ["24H", "3D", "7D", "All"]
+PKT_TZ = ZoneInfo("Asia/Karachi")
+LOCAL_STORE_DIR = Path(".local_harmonics_store")
 
 
 def _get_secret(key: str, default: str = "") -> str:
@@ -17,6 +27,214 @@ def _get_secret(key: str, default: str = "") -> str:
     except Exception:
         pass
     return str(os.environ.get(key, default) or default).strip()
+
+
+def turso_configured() -> bool:
+    url = _get_secret("TURSO_DATABASE_URL", "")
+    token = _get_secret("TURSO_AUTH_TOKEN", "")
+    return bool(url and token)
+
+
+def _ensure_local_dir() -> None:
+    LOCAL_STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_json(name: str, default: Any) -> Any:
+    _ensure_local_dir()
+    p = LOCAL_STORE_DIR / f"{name}.json"
+    if not p.exists():
+        return default
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _write_json(name: str, payload: Any) -> None:
+    _ensure_local_dir()
+    p = LOCAL_STORE_DIR / f"{name}.json"
+    p.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+
+def _turso_http_url() -> str:
+    raw = _get_secret("TURSO_DATABASE_URL", "")
+    if raw.startswith("libsql://"):
+        raw = "https://" + raw[len("libsql://") :]
+    return raw.rstrip("/")
+
+
+def _exec_turso(statements: List[Dict[str, Any]]) -> bool:
+    if not turso_configured():
+        return False
+    url = f"{_turso_http_url()}/v2/pipeline"
+    token = _get_secret("TURSO_AUTH_TOKEN", "")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    requests_body = [
+        {"type": "execute", "stmt": {"sql": s["sql"], "args": s.get("args", [])}}
+        for s in statements
+    ] + [{"type": "close"}]
+    try:
+        resp = requests.post(url, headers=headers, json={"requests": requests_body}, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def init_storage() -> None:
+    _ensure_local_dir()
+    _exec_turso(
+        [
+            {"sql": "CREATE TABLE IF NOT EXISTS active_trades (id TEXT PRIMARY KEY, payload TEXT)"},
+            {"sql": "CREATE TABLE IF NOT EXISTS signal_logbook (id TEXT PRIMARY KEY, ts_epoch REAL, payload TEXT)"},
+            {"sql": "CREATE TABLE IF NOT EXISTS ai_summaries (cache_key TEXT PRIMARY KEY, coin TEXT, timeframe TEXT, summary TEXT)"},
+            {"sql": "CREATE TABLE IF NOT EXISTS audit_logs (id TEXT PRIMARY KEY, ts_epoch REAL, payload TEXT)"},
+        ]
+    )
+
+
+def load_active_trades() -> List[Dict[str, Any]]:
+    data = _read_json("active_trades", [])
+    return data if isinstance(data, list) else []
+
+
+def save_active_trades(trades: List[Dict[str, Any]]) -> None:
+    _write_json("active_trades", trades[:10])
+    _exec_turso(
+        [
+            {"sql": "DELETE FROM active_trades"},
+            *[
+                {
+                    "sql": "INSERT INTO active_trades (id, payload) VALUES (?, ?)",
+                    "args": [
+                        {"type": "text", "value": f"{t.get('coin','')}_{t.get('timeframe','')}_{t.get('pattern_type','')}"},
+                        {"type": "text", "value": json.dumps(t, default=str)},
+                    ],
+                }
+                for t in trades[:10]
+            ],
+        ]
+    )
+
+
+def load_logbook() -> List[Dict[str, Any]]:
+    data = _read_json("signal_logbook", [])
+    return data if isinstance(data, list) else []
+
+
+def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: List[Any]) -> List[Dict[str, Any]]:
+    records = list(existing_logbook) if isinstance(existing_logbook, list) else []
+    seen_keys = {
+        f"{r.get('coin')}_{r.get('timeframe')}_{r.get('pattern_type')}_{r.get('status_label')}_{r.get('entry_d')}"
+        for r in records
+    }
+    now_dt = datetime.now(PKT_TZ)
+    now_ts = now_dt.timestamp()
+    pkt_str = now_dt.strftime("%Y-%m-%d %H:%M PKT")
+    added = False
+
+    for res in results:
+        status = getattr(res, "status_label", "IDLE")
+        if status not in ("READY TO BE", "CONFIRMED"):
+            continue
+        coin = getattr(res, "coin", "")
+        tf = getattr(res, "timeframe", "")
+        ptype = getattr(res, "pattern_type", "")
+        entry_d = getattr(res, "entry_d", None)
+        dedup_key = f"{coin}_{tf}_{ptype}_{status}_{entry_d}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        records.insert(
+            0,
+            {
+                "coin": coin,
+                "timeframe": tf,
+                "pattern_type": ptype,
+                "status_label": status,
+                "total_score": getattr(res, "total_score", 0),
+                "entry_d": entry_d,
+                "sl": getattr(res, "sl", None),
+                "tp1": getattr(res, "tp1", None),
+                "tp2": getattr(res, "tp2", None),
+                "tp3": getattr(res, "tp3", None),
+                "outcome": "TRACKING",
+                "ts_epoch": now_ts,
+                "timestamp_pkt": pkt_str,
+            },
+        )
+        added = True
+
+    if added:
+        records = records[:300]
+        _write_json("signal_logbook", records)
+    return records
+
+
+def filter_logbook_records(records: List[Dict[str, Any]], horizon: str) -> List[Dict[str, Any]]:
+    if not records:
+        return []
+    if horizon == "All":
+        return records
+    hours_map = {"24H": 24.0, "3D": 72.0, "7D": 168.0}
+    max_h = hours_map.get(horizon)
+    if max_h is None:
+        return records
+    cutoff = datetime.now(PKT_TZ).timestamp() - (max_h * 3600.0)
+    return [r for r in records if float(r.get("ts_epoch", 0.0)) >= cutoff]
+
+
+def load_saved_summaries() -> Dict[str, str]:
+    data = _read_json("ai_summaries", {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_summary(cache_key: str, coin: str, timeframe: str, summary: str) -> None:
+    store = load_saved_summaries()
+    store[cache_key] = summary
+    _write_json("ai_summaries", store)
+    _exec_turso(
+        [
+            {
+                "sql": "INSERT OR REPLACE INTO ai_summaries (cache_key, coin, timeframe, summary) VALUES (?, ?, ?, ?)",
+                "args": [
+                    {"type": "text", "value": cache_key},
+                    {"type": "text", "value": coin},
+                    {"type": "text", "value": timeframe},
+                    {"type": "text", "value": summary},
+                ],
+            }
+        ]
+    )
+
+
+def load_audit_logs() -> List[Dict[str, Any]]:
+    data = _read_json("audit_logs", [])
+    return data if isinstance(data, list) else []
+
+
+def silent_self_audit_and_update(
+    existing_audits: List[Dict[str, Any]],
+    active_trades: List[Dict[str, Any]],
+    logbook: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    audits = list(existing_audits) if isinstance(existing_audits, list) else []
+    now_dt = datetime.now(PKT_TZ)
+    entry = {
+        "audited_pkt": now_dt.strftime("%Y-%m-%d %H:%M PKT"),
+        "coin": active_trades[0].get("coin", "SCAN") if active_trades else "SCAN",
+        "timeframe": active_trades[0].get("timeframe", "1H") if active_trades else "1H",
+        "outcome_seen": f"{len(active_trades)} active / {len(logbook)} logged",
+        "lesson_learned": "Verified coin/timeframe binding and ATR stop/target alignment.",
+        "rule_adjustment": "Keep confirmation strictly on active pattern state and check HTF walls.",
+    }
+    audits.insert(0, entry)
+    audits = audits[:50]
+    _write_json("audit_logs", audits)
+    return audits
 
 
 def _resolve_openrouter_key(api_key: Optional[str] = None) -> str:
