@@ -13,12 +13,12 @@ class BatScanResult:
     symbol: str
     coin: str
     timeframe: str
-    state: int  # 0: Hunting Waves, 1: READY TO BE, 2: CONFIRMED (ACTIVE), 3: INVALID
-    status_label: str  # "READY TO BE" | "CONFIRMED" | "IDLE"
-    status_desc: str  # Exact Pine-style status description
+    state: int
+    status_label: str
+    status_desc: str
     error_msg: str
     sig_code: str
-    pattern_type: str  # "BULLISH" | "BEARISH" | ""
+    pattern_type: str
     overstretched: bool
     conf_score: int
     conf_pct: float
@@ -29,7 +29,7 @@ class BatScanResult:
     entry_d: Optional[float] = None
     optimal_zone_low: Optional[float] = None
     optimal_zone_high: Optional[float] = None
-    sl: Optional[float] = None  # Exact Pine ATR stop-loss: (A ± 1.113*XA) ± (ATR * atrMult)
+    sl: Optional[float] = None
     secondary_sl: Optional[float] = None
     bias_change_level: Optional[float] = None
     tp1: Optional[float] = None
@@ -51,7 +51,6 @@ class BatScanResult:
 
 
 def _pine_pivothigh(high: np.ndarray, left: int, right: int) -> List[int]:
-    """Matches Pine's ta.pivothigh(high, pivotLeft, pivotRight) bar registration."""
     idxs: List[int] = []
     n = len(high)
     for i in range(left, n - right):
@@ -63,7 +62,6 @@ def _pine_pivothigh(high: np.ndarray, left: int, right: int) -> List[int]:
 
 
 def _pine_pivotlow(low: np.ndarray, left: int, right: int) -> List[int]:
-    """Matches Pine's ta.pivotlow(low, pivotLeft, pivotRight) bar registration."""
     idxs: List[int] = []
     n = len(low)
     for i in range(left, n - right):
@@ -209,7 +207,6 @@ def run_bat_engine(
         cur_high = float(high[bar_idx])
         cur_low = float(low[bar_idx])
 
-        # Matches Pine: if internalState == 0 or internalState == 3
         if internal_state == 0 or internal_state == 3:
             if len(low_prc_arr) >= 2 and len(high_prc_arr) >= 2:
                 px_i, px_p = low_idx_arr[1], low_prc_arr[1]
@@ -236,7 +233,6 @@ def run_bat_engine(
                         price_sl = (a_price - (1.113 * xa_h)) - (cur_atr * atr_m)
                         price_tp1 = price_tp2 = price_tp3 = np.nan
 
-            # Matches Pine: if internalState == 0 and array.size(high_prc_arr) >= 2 ...
             if internal_state == 0 and len(high_prc_arr) >= 2 and len(low_prc_arr) >= 2:
                 px_i, px_p = high_idx_arr[1], high_prc_arr[1]
                 pa_i, pa_p = low_idx_arr[1], low_prc_arr[1]
