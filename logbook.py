@@ -25,6 +25,18 @@ def save_logbook(records: List[Dict[str, Any]]) -> None:
     LOGBOOK_PATH.write_text(json.dumps(records, indent=2), encoding="utf-8")
 
 
+def _normalize_status(res: Any) -> str:
+    status = getattr(res, "status_label", None)
+    if status:
+        return str(status)
+    phase = str(getattr(res, "phase", "")).upper()
+    if phase in ("IN MAKING", "READY TO BE"):
+        return "READY TO BE"
+    if phase in ("MADE", "CONFIRMED"):
+        return "CONFIRMED"
+    return "IDLE"
+
+
 def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[Any]) -> List[Dict[str, Any]]:
     existing_keys = {
         (
@@ -40,27 +52,34 @@ def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[A
     ts_str = now_pkt().strftime("%Y-%m-%d %H:%M:%S PKT")
 
     for res in scan_results:
-        if res.status_label not in ("READY TO BE", "CONFIRMED") or res.entry_d is None:
+        status_label = _normalize_status(res)
+        entry_d = getattr(res, "entry_d", None)
+        if status_label not in ("READY TO BE", "CONFIRMED") or entry_d is None:
             continue
-        key = (res.coin, res.timeframe, res.pattern_type, res.status_label, round(float(res.entry_d), 6))
+
+        coin = getattr(res, "coin", "")
+        timeframe = getattr(res, "timeframe", "")
+        pattern_type = getattr(res, "pattern_type", "")
+        key = (coin, timeframe, pattern_type, status_label, round(float(entry_d), 6))
+
         if key not in existing_keys:
             existing_keys.add(key)
             records.insert(
                 0,
                 {
                     "timestamp_pkt": ts_str,
-                    "coin": res.coin,
-                    "timeframe": res.timeframe,
-                    "pattern_type": res.pattern_type,
-                    "status_label": res.status_label,
-                    "sig_code": res.sig_code,
-                    "conf_score": res.conf_score,
-                    "conf_pct": res.conf_pct,
-                    "entry_d": res.entry_d,
-                    "sl": res.sl,
-                    "tp1": res.tp1,
-                    "tp2": res.tp2,
-                    "tp3": res.tp3,
+                    "coin": coin,
+                    "timeframe": timeframe,
+                    "pattern_type": pattern_type,
+                    "status_label": status_label,
+                    "sig_code": getattr(res, "sig_code", "-"),
+                    "conf_score": getattr(res, "conf_score", 0),
+                    "conf_pct": getattr(res, "conf_pct", 0.0),
+                    "entry_d": entry_d,
+                    "sl": getattr(res, "sl", None),
+                    "tp1": getattr(res, "tp1", None),
+                    "tp2": getattr(res, "tp2", None),
+                    "tp3": getattr(res, "tp3", None),
                     "outcome": "OPEN",
                 },
             )
@@ -72,26 +91,29 @@ def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[A
 
 
 def filter_logbook_by_horizon(records: List[Dict[str, Any]], horizon: str) -> pd.DataFrame:
+    cols = [
+        "Time (PKT)",
+        "Coin",
+        "TF",
+        "Dir",
+        "Stage",
+        "Sig",
+        "Conf %",
+        "Entry",
+        "SL",
+        "TP1",
+        "TP2",
+        "TP3",
+        "Outcome",
+    ]
     if not records:
-        return pd.DataFrame(
-            columns=[
-                "Time (PKT)",
-                "Coin",
-                "TF",
-                "Dir",
-                "Stage",
-                "Sig",
-                "Conf %",
-                "Entry",
-                "SL",
-                "TP1",
-                "TP2",
-                "TP3",
-                "Outcome",
-            ]
-        )
+        return pd.DataFrame(columns=cols)
+
     df = pd.DataFrame(records)
-    df["parsed_dt"] = pd.to_datetime(df["timestamp_pkt"].str.replace(" PKT", "", regex=False), errors="coerce")
+    df["parsed_dt"] = pd.to_datetime(
+        df["timestamp_pkt"].astype(str).str.replace(" PKT", "", regex=False),
+        errors="coerce",
+    )
     cutoff = now_pkt().replace(tzinfo=None) - {
         "1D": pd.Timedelta(days=1),
         "4H": pd.Timedelta(hours=4),
@@ -105,18 +127,18 @@ def filter_logbook_by_horizon(records: List[Dict[str, Any]], horizon: str) -> pd
 
     return pd.DataFrame(
         {
-            "Time (PKT)": sub["timestamp_pkt"],
-            "Coin": sub["coin"],
-            "TF": sub["timeframe"],
-            "Dir": sub["pattern_type"],
-            "Stage": sub["status_label"],
-            "Sig": sub["sig_code"],
-            "Conf %": sub["conf_pct"].map(lambda x: f"{x:.1f}%"),
-            "Entry": sub["entry_d"],
-            "SL": sub["sl"],
-            "TP1": sub["tp1"],
-            "TP2": sub["tp2"],
-            "TP3": sub["tp3"],
-            "Outcome": sub["outcome"],
+            "Time (PKT)": sub.get("timestamp_pkt", ""),
+            "Coin": sub.get("coin", ""),
+            "TF": sub.get("timeframe", ""),
+            "Dir": sub.get("pattern_type", ""),
+            "Stage": sub.get("status_label", ""),
+            "Sig": sub.get("sig_code", "-"),
+            "Conf %": sub.get("conf_pct", 0.0).map(lambda x: f"{float(x or 0.0):.1f}%"),
+            "Entry": sub.get("entry_d"),
+            "SL": sub.get("sl"),
+            "TP1": sub.get("tp1"),
+            "TP2": sub.get("tp2"),
+            "TP3": sub.get("tp3"),
+            "Outcome": sub.get("outcome", "OPEN"),
         }
     )
