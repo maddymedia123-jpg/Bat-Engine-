@@ -1,1 +1,197 @@
+from __future__ import annotations
 
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+KUCOIN_BASE_URL = "https://api.kucoin.com"
+
+# Initial timeframes: 1H, 2H, 4H, 1D (easy to expand later)
+TIMEFRAME_OPTIONS: Dict[str, str] = {
+    "1H": "1hour",
+    "2H": "2hour",
+    "4H": "4hour",
+    "1D": "1day",
+}
+
+TV_INTERVAL_MAP: Dict[str, str] = {
+    "1H": "60",
+    "2H": "120",
+    "4H": "240",
+    "1D": "1D",
+}
+
+DEFAULT_SYMBOLS: List[str] = [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "BNB-USDT",
+    "XRP-USDT",
+    "DOGE-USDT",
+    "ADA-USDT",
+    "LINK-USDT",
+    "AVAX-USDT",
+    "DOT-USDT",
+]
+
+COINGECKO_ID_MAP: Dict[str, str] = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "BNB": "binancecoin",
+    "XRP": "ripple",
+    "DOGE": "dogecoin",
+    "ADA": "cardano",
+    "LINK": "chainlink",
+    "AVAX": "avalanche-2",
+    "DOT": "polkadot",
+}
+
+
+def clean_coin_name(symbol: str) -> str:
+    s = symbol.upper().split(":")[-1].replace(".P", "")
+    for suffix in ("-USDT", "-USDC", "-USD", "USDT", "USDC", "USD"):
+        if s.endswith(suffix):
+            return s[: -len(suffix)]
+    return s
+
+
+def to_kucoin_symbol(symbol: str) -> str:
+    s = symbol.upper().split(":")[-1].replace(".P", "")
+    if "-" in s:
+        return s
+    for quote in ("USDT", "USDC", "USD"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}-{quote}"
+    return f"{s}-USDT"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_kucoin_klines(symbol: str, tf_label: str, limit: int = 250) -> pd.DataFrame:
+    kc_symbol = to_kucoin_symbol(symbol)
+    kc_type = TIMEFRAME_OPTIONS.get(tf_label, "1hour")
+    params = {"symbol": kc_symbol, "type": kc_type}
+    resp = requests.get(f"{KUCOIN_BASE_URL}/api/v1/market/candles", params=params, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+    raw = payload.get("data", [])
+    if not raw:
+        return pd.DataFrame(columns=["timestamp", "open", "close", "high", "low", "volume"])
+
+    # KuCoin returns newest-first: [time, open, close, high, low, volume, turnover]
+    rows = []
+    for item in raw[:limit]:
+        rows.append(
+            {
+                "timestamp": pd.to_datetime(int(item[0]), unit="s", utc=True),
+                "open": float(item[1]),
+                "close": float(item[2]),
+                "high": float(item[3]),
+                "low": float(item[4]),
+                "volume": float(item[5]),
+            }
+        )
+    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_kucoin_last_price(symbol: str) -> Optional[float]:
+    kc_symbol = to_kucoin_symbol(symbol)
+    resp = requests.get(
+        f"{KUCOIN_BASE_URL}/api/v1/market/orderbook/level1",
+        params={"symbol": kc_symbol},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data") or {}
+    price = data.get("price")
+    return float(price) if price is not None else None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_web_reference_prices(coins: Tuple[str, ...]) -> Dict[str, Optional[float]]:
+    ids = [COINGECKO_ID_MAP[c] for c in coins if c in COINGECKO_ID_MAP]
+    result: Dict[str, Optional[float]] = {c: None for c in coins}
+    if not ids:
+        return result
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ",".join(sorted(set(ids))), "vs_currencies": "usd"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for coin in coins:
+            cg_id = COINGECKO_ID_MAP.get(coin)
+            if cg_id and cg_id in data and "usd" in data[cg_id]:
+                result[coin] = float(data[cg_id]["usd"])
+    except Exception:
+        pass
+    return result
+
+
+def compute_price_correlation(kucoin_price: Optional[float], web_price: Optional[float]) -> Dict[str, Optional[float]]:
+    if kucoin_price is None or kucoin_price == 0:
+        return {"kucoin": kucoin_price, "web": web_price, "diff_abs": None, "diff_pct": None, "ratio": None}
+    if web_price is None or web_price == 0:
+        return {"kucoin": kucoin_price, "web": None, "diff_abs": 0.0, "diff_pct": 0.0, "ratio": 1.0}
+    diff_abs = web_price - kucoin_price
+    diff_pct = (diff_abs / kucoin_price) * 100.0
+    ratio = web_price / kucoin_price
+    return {
+        "kucoin": kucoin_price,
+        "web": web_price,
+        "diff_abs": diff_abs,
+        "diff_pct": diff_pct,
+        "ratio": ratio,
+    }
+
+
+def fetch_liquidation_snapshot(coin: str) -> Dict[str, str]:
+    """
+    Hook for free liquidation feeds (to be wired in a later step).
+    Returns a clean placeholder status so the UI is ready now.
+    """
+    return {
+        "coin": coin,
+        "liq_bias": "Pending Feed",
+        "key_liq_zone": "N/A (Hook Ready)",
+    }
+
+
+def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def compute_stoch_rsi(rsi: pd.Series, stoch_len: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[pd.Series, pd.Series]:
+    min_rsi = rsi.rolling(stoch_len, min_periods=1).min()
+    max_rsi = rsi.rolling(stoch_len, min_periods=1).max()
+    denom = (max_rsi - min_rsi).replace(0.0, np.nan)
+    raw_k = ((rsi - min_rsi) / denom * 100.0).fillna(50.0)
+    k = raw_k.rolling(smooth_k, min_periods=1).mean()
+    d = k.rolling(smooth_d, min_periods=1).mean()
+    return k, d
+
+
+def compute_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean().bfill()
