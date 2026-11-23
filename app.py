@@ -9,18 +9,18 @@ import streamlit.components.v1 as components
 
 from bat_engine import BatScanResult, enrich_multi_timeframe_context, run_bat_engine
 from market_data import (
-    DEFAULT_20_SYMBOLS,
+    DEFAULT_PERP_SYMBOLS,
     TF_HOURS,
     TIMEFRAME_OPTIONS,
     TV_INTERVAL_MAP,
     clean_coin_name,
     compute_price_correlation,
-    fetch_kucoin_klines,
-    fetch_kucoin_last_price,
     fetch_liquidation_snapshot,
+    fetch_perp_klines,
+    fetch_perp_last_price,
     fetch_web_reference_prices,
     format_eta_pkt,
-    to_kucoin_symbol,
+    to_perp_symbol,
 )
 from turso_store import (
     HORIZONS,
@@ -41,11 +41,10 @@ from turso_store import (
 st.set_page_config(page_title="Harmonics Engine — Bat Pattern", layout="wide")
 
 
-def fmt_price(val: Optional[float], scale: float = 1.0) -> str:
+def fmt_price(val: Optional[float]) -> str:
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return "-"
-    adj = val * scale
-    return f"${adj:.6f}".rstrip("0").rstrip(".")
+    return f"${val:.6f}".rstrip("0").rstrip(".")
 
 
 def compute_tp_progress(
@@ -99,7 +98,6 @@ def render_pattern_mapping_chart(
     df: pd.DataFrame,
     res: BatScanResult,
     liq_info: Dict[str, Optional[float] | str],
-    scale: float = 1.0,
 ) -> go.Figure:
     fig = go.Figure()
     if df is None or df.empty:
@@ -113,19 +111,19 @@ def render_pattern_mapping_chart(
     fig.add_trace(
         go.Candlestick(
             x=x_vals,
-            open=plot_df["open"] * scale,
-            high=plot_df["high"] * scale,
-            low=plot_df["low"] * scale,
-            close=plot_df["close"] * scale,
+            open=plot_df["open"],
+            high=plot_df["high"],
+            low=plot_df["low"],
+            close=plot_df["close"],
             name=f"{res.coin} {res.timeframe}",
         )
     )
 
     if res.pivots and all(k in res.pivots for k in ("X", "A", "B", "C")):
-        px_i, px_v = res.pivots["X"][0] - offset, res.pivots["X"][1] * scale
-        pa_i, pa_v = res.pivots["A"][0] - offset, res.pivots["A"][1] * scale
-        pb_i, pb_v = res.pivots["B"][0] - offset, res.pivots["B"][1] * scale
-        pc_i, pc_v = res.pivots["C"][0] - offset, res.pivots["C"][1] * scale
+        px_i, px_v = res.pivots["X"][0] - offset, res.pivots["X"][1]
+        pa_i, pa_v = res.pivots["A"][0] - offset, res.pivots["A"][1]
+        pb_i, pb_v = res.pivots["B"][0] - offset, res.pivots["B"][1]
+        pc_i, pc_v = res.pivots["C"][0] - offset, res.pivots["C"][1]
 
         formed_x = [i for i in (px_i, pa_i, pb_i, pc_i) if i >= 0]
         formed_y = [v for i, v in zip((px_i, pa_i, pb_i, pc_i), (px_v, pa_v, pb_v, pc_v)) if i >= 0]
@@ -148,7 +146,7 @@ def render_pattern_mapping_chart(
             fig.add_trace(
                 go.Scatter(
                     x=[pc_i, end_x],
-                    y=[pc_v, res.entry_d * scale],
+                    y=[pc_v, res.entry_d],
                     mode="lines",
                     name="C -> D Leg",
                     line=dict(
@@ -161,8 +159,8 @@ def render_pattern_mapping_chart(
 
     if res.zone_low is not None and res.zone_high is not None:
         fig.add_hrect(
-            y0=res.zone_low * scale,
-            y1=res.zone_high * scale,
+            y0=res.zone_low,
+            y1=res.zone_high,
             fillcolor="rgba(0, 200, 83, 0.15)" if res.pattern_type == "BULLISH" else "rgba(255, 59, 59, 0.15)",
             line_width=1,
             line_dash="dot",
@@ -171,28 +169,28 @@ def render_pattern_mapping_chart(
         )
 
     if res.entry_d is not None:
-        fig.add_hline(y=res.entry_d * scale, line_dash="dash", line_color="#FFD54F", annotation_text="Entry (D)")
+        fig.add_hline(y=res.entry_d, line_dash="dash", line_color="#FFD54F", annotation_text="Entry (D)")
     if res.sl is not None:
-        fig.add_hline(y=res.sl * scale, line_dash="solid", line_color="#FF3B3B", annotation_text="ATR SL")
+        fig.add_hline(y=res.sl, line_dash="solid", line_color="#FF3B3B", annotation_text="ATR SL")
     if res.secondary_sl is not None:
-        fig.add_hline(y=res.secondary_sl * scale, line_dash="dashdot", line_color="#FF9800", annotation_text="Secondary SL")
+        fig.add_hline(y=res.secondary_sl, line_dash="dashdot", line_color="#FF9800", annotation_text="Secondary SL")
     if res.bias_change_level is not None:
-        fig.add_hline(y=res.bias_change_level * scale, line_dash="longdash", line_color="#AB47BC", annotation_text="Bias-Change")
+        fig.add_hline(y=res.bias_change_level, line_dash="longdash", line_color="#AB47BC", annotation_text="Bias-Change")
     if res.nearest_support is not None:
-        fig.add_hline(y=res.nearest_support * scale, line_dash="dot", line_color="#29B6F6", annotation_text="Nearest Support")
+        fig.add_hline(y=res.nearest_support, line_dash="dot", line_color="#29B6F6", annotation_text="Nearest Support")
     if res.nearest_resistance is not None:
-        fig.add_hline(y=res.nearest_resistance * scale, line_dash="dot", line_color="#FFA726", annotation_text="Nearest Resistance")
+        fig.add_hline(y=res.nearest_resistance, line_dash="dot", line_color="#FFA726", annotation_text="Nearest Resistance")
 
     upper_liq = liq_info.get("upper_liq")
     lower_liq = liq_info.get("lower_liq")
     if isinstance(upper_liq, (int, float)):
-        fig.add_hline(y=float(upper_liq) * scale, line_dash="dot", line_color="#EF5350", annotation_text="Est. Liq High")
+        fig.add_hline(y=float(upper_liq), line_dash="dot", line_color="#EF5350", annotation_text="Est. Liq High")
     if isinstance(lower_liq, (int, float)):
-        fig.add_hline(y=float(lower_liq) * scale, line_dash="dot", line_color="#26A69A", annotation_text="Est. Liq Low")
+        fig.add_hline(y=float(lower_liq), line_dash="dot", line_color="#26A69A", annotation_text="Est. Liq Low")
 
     for tp_val, label in ((res.tp1, "TP1"), (res.tp2, "TP2"), (res.tp3, "TP3")):
         if tp_val is not None:
-            fig.add_hline(y=tp_val * scale, line_dash="dot", line_color="#3DDC84", annotation_text=label)
+            fig.add_hline(y=tp_val, line_dash="dot", line_color="#3DDC84", annotation_text=label)
 
     fig.update_layout(
         template="plotly_dark",
@@ -204,12 +202,11 @@ def render_pattern_mapping_chart(
     return fig
 
 
-# Initialize persistent storage & session state once
 if "storage_ready" not in st.session_state:
     init_storage()
     st.session_state.storage_ready = True
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = list(DEFAULT_20_SYMBOLS)
+    st.session_state.watchlist = list(DEFAULT_PERP_SYMBOLS)
 if "active_trades" not in st.session_state:
     st.session_state.active_trades = load_active_trades()
 if "logbook" not in st.session_state:
@@ -222,14 +219,14 @@ if "show_summary_toggle" not in st.session_state:
     st.session_state.show_summary_toggle = True
 
 with st.sidebar:
-    st.header("Watchlist & Timeframes (20+ Coins)")
+    st.header("Swap Futures Watchlist & Timeframes")
     st.caption(f"Turso Cloud: {'Connected' if turso_configured() else 'Local Fallback (Add Secrets for Turso)'}")
 
     add_col, del_col = st.columns(2)
     with add_col:
-        new_coin_raw = st.text_input("Add Coin", placeholder="e.g. LINK or LINK-USDT")
+        new_coin_raw = st.text_input("Add Swap", placeholder="e.g. BTCUSDT.P or SOL")
         if st.button("Add Coin", use_container_width=True) and new_coin_raw.strip():
-            formatted = to_kucoin_symbol(new_coin_raw.strip())
+            formatted = to_perp_symbol(new_coin_raw.strip())
             if formatted not in st.session_state.watchlist:
                 st.session_state.watchlist.append(formatted)
                 st.rerun()
@@ -240,29 +237,24 @@ with st.sidebar:
             st.session_state.watchlist = [c for c in st.session_state.watchlist if c != del_target]
             st.rerun()
 
-    st.caption(f"Active Watchlist Count: {len(st.session_state.watchlist)} coins")
+    st.caption(f"Active Watchlist Count: {len(st.session_state.watchlist)} swap contracts")
     selected_tfs = st.multiselect(
-        "Timeframes (Initial: 1H, 2H, 4H, 1D)",
+        "Timeframes (1H, 2H, 4H, 1D)",
         options=list(TIMEFRAME_OPTIONS.keys()),
         default=["1H", "2H", "4H", "1D"],
     )
 
     st.divider()
-    st.subheader("Background Live Scanning")
+    st.subheader("Live Scanning")
     auto_refresh = st.checkbox("Smooth auto-refresh", value=True)
     refresh_sec = st.slider("Refresh interval (sec)", min_value=20, max_value=180, value=60, step=10)
 
     st.divider()
     st.subheader("AI Agent Key (On-Demand Only)")
-    ai_api_key = st.text_input("AI API Key (Optional)", type="password", placeholder="sk-...")
+    ai_api_key = st.text_input("AI API Key Override (Optional)", type="password", placeholder="sk-...")
 
     st.divider()
     st.subheader("Display Options")
-    price_mode = st.radio(
-        "Display levels in:",
-        options=["KuCoin Native", "Web / Reference Adjusted"],
-        index=0,
-    )
     show_overstretched = st.checkbox("Show overstretched READY TO BE (W) rows", value=False)
 
     with st.expander("Pine Bat Engine Parameters"):
@@ -282,7 +274,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-symbols_list = st.session_state.watchlist if st.session_state.watchlist else list(DEFAULT_20_SYMBOLS)
+symbols_list = st.session_state.watchlist if st.session_state.watchlist else list(DEFAULT_PERP_SYMBOLS)
 if not selected_tfs:
     selected_tfs = ["1H", "2H", "4H", "1D"]
 
@@ -301,20 +293,13 @@ params = {
 }
 
 st.title("Harmonics Engine")
-st.caption("Pine-aligned Bat scanner with ATR primary SL, secondary trailing SL, Turso cloud persistence, and on-demand institutional AI agent.")
+st.caption("Pine v6 BatPattern engine on swap futures (defaulting to BTCUSDT.P) with ATR SL, price correlation display, Turso persistence, and on-demand AI agent.")
 
-coins_tuple = tuple(clean_coin_name(s) for s in symbols_list)
-web_prices = fetch_web_reference_prices(coins_tuple)
-
-corr_by_coin: Dict[str, Dict[str, Optional[float]]] = {}
+coins_list = [clean_coin_name(s) for s in symbols_list]
+last_price_by_coin: Dict[str, Optional[float]] = {}
 for sym in symbols_list:
     coin = clean_coin_name(sym)
-    kc_last = None
-    try:
-        kc_last = fetch_kucoin_last_price(sym)
-    except Exception:
-        kc_last = None
-    corr_by_coin[coin] = compute_price_correlation(kc_last, web_prices.get(coin))
+    last_price_by_coin[coin] = fetch_perp_last_price(sym)
 
 results: List[BatScanResult] = []
 df_lookup: Dict[tuple, pd.DataFrame] = {}
@@ -323,11 +308,11 @@ for tf in selected_tfs:
     for sym in symbols_list:
         coin = clean_coin_name(sym)
         try:
-            df = fetch_kucoin_klines(sym, tf, limit=250)
-            if corr_by_coin[coin]["kucoin"] is None and not df.empty:
-                corr_by_coin[coin] = compute_price_correlation(float(df["close"].iloc[-1]), web_prices.get(coin))
+            df = fetch_perp_klines(sym, tf, limit=250)
+            if last_price_by_coin.get(coin) is None and not df.empty:
+                last_price_by_coin[coin] = float(df["close"].iloc[-1])
         except Exception as exc:
-            st.warning(f"KuCoin fetch issue for {coin} ({tf}): {exc}")
+            st.warning(f"Swap fetch issue for {coin} ({tf}): {exc}")
             df = pd.DataFrame()
         df_lookup[(coin, tf)] = df
         results.append(run_bat_engine(df, sym, coin, tf, params))
@@ -336,13 +321,12 @@ results = enrich_multi_timeframe_context(results)
 st.session_state.logbook = record_generated_signals(st.session_state.logbook, results)
 result_map: Dict[tuple, BatScanResult] = {(r.coin, r.timeframe): r for r in results}
 
-# Update active locked trades live & persist to Turso
 trades_changed = False
 for trade in st.session_state.active_trades:
     coin = trade["coin"]
     tf = trade["timeframe"]
     direction = trade["pattern_type"]
-    live_price = corr_by_coin.get(coin, {}).get("kucoin")
+    live_price = last_price_by_coin.get(coin)
     if live_price is None:
         live_price = trade.get("last_price")
     trade["last_price"] = live_price
@@ -393,17 +377,11 @@ if trades_changed:
 
 
 def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, target_ctx: Dict[str, object]) -> None:
-    """
-    Runs ONLY when the user clicks Run / Re-run Summary. Silently audits & updates
-    agent memory, and refreshes summaries across committed trades and the target chart setup.
-    """
     st.session_state.audit_logs = silent_self_audit_and_update(
         st.session_state.audit_logs,
         st.session_state.active_trades,
         st.session_state.logbook,
     )
-
-    # Update target setup summary
     t_key = f"{target_coin}_{target_tf}"
     t_summary = run_on_demand_trader_agent(
         target_coin=target_coin,
@@ -416,7 +394,6 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
     st.session_state.ai_summaries[t_key] = t_summary
     save_summary(t_key, target_coin, target_tf, t_summary)
 
-    # Simultaneously update summaries for all committed active trades
     for tr in st.session_state.active_trades:
         c = tr.get("coin", "")
         tf = tr.get("timeframe", "")
@@ -433,7 +410,7 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
         save_summary(ckey, c, tf, csum)
 
 
-# 1. ACTIVE TRADE MONITORING TERMINAL (Always visible)
+# 1. ACTIVE TRADE MONITORING TERMINAL
 st.subheader(f"Active Trade Monitoring Terminal ({len(st.session_state.active_trades)} / 10 Locked)")
 if st.session_state.active_trades:
     tf_tabs = st.tabs(["All Active Trades"] + [f"Active {t} Trades" for t in selected_tfs])
@@ -465,7 +442,7 @@ if st.session_state.active_trades:
                 with st.container(border=True):
                     c1, c2, c3, c4, c5 = st.columns([1.7, 1.9, 2.6, 2.0, 0.9])
                     with c1:
-                        st.markdown(f"### {coin}/USDT · `{tf}`")
+                        st.markdown(f"### {coin}USDT.P · `{tf}`")
                         st.markdown(f"**{direction}** · `{trade.get('sig_code', 'C')}` ({trade.get('conf_pct', 0.0):.0f}%)")
                         st.caption(f"Score: **{trade.get('total_score', 0)}/100**")
 
@@ -525,7 +502,6 @@ if st.session_state.active_trades:
                             save_active_trades(st.session_state.active_trades)
                             st.rerun()
 
-                    # Collapsible on-demand AI agent summary + toggle + self-audit log
                     has_sum = s_key in st.session_state.ai_summaries
                     btn_lbl = "Re-run AI Summary (Committed Sync)" if has_sum else "Run AI Summary (On-Demand)"
                     with st.expander(f"AI Trader Summary & Self-Audit — {coin} [{tf}]", expanded=False):
@@ -561,7 +537,7 @@ if st.session_state.active_trades:
 else:
     st.info("No active trades locked yet. Lock a CONFIRMED signal from the Bat Pattern tab below.")
 
-# 2. PATTERN TABS (Bat Pattern first; ready for extra patterns in separate tabs)
+# 2. PATTERN TABS
 st.divider()
 pattern_tabs = st.tabs(["Bat Pattern", "More Patterns (Soon)"])
 
@@ -580,32 +556,28 @@ with pattern_tabs[0]:
             return
 
         for idx, r in enumerate(items):
-            scale = 1.0
-            if price_mode == "Web / Reference Adjusted" and corr_by_coin[r.coin]["ratio"]:
-                scale = float(corr_by_coin[r.coin]["ratio"])
-
             badge_color = "#00C853" if r.pattern_type == "BULLISH" else "#FF3B3B"
             with st.container(border=True):
                 st.markdown(
-                    f"<span style='color:{badge_color};font-weight:700;'>{r.coin}/USDT · {r.pattern_type} · [{r.timeframe}]</span> "
-                    f"— **`{r.sig_code}`** | Conf: **{r.conf_pct:.0f}%** | Score: **{r.total_score}/100**",
+                    f"<span style='color:{badge_color};font-weight:700;'>{r.coin}USDT.P · {r.pattern_type} · [{r.timeframe}]</span> "
+                    f"— **`{r.sig_code}`** ({r.status_desc}) | Conf: **{r.conf_pct:.0f}%** | Score: **{r.total_score}/100**",
                     unsafe_allow_html=True,
                 )
                 st.markdown(
-                    f"**Entry (D):** `{fmt_price(r.entry_d, scale)}` · "
-                    f"**ATR SL:** `{fmt_price(r.sl, scale)}` · "
-                    f"**TP1:** `{fmt_price(r.tp1, scale)}` · "
-                    f"**TP2/3:** `{fmt_price(r.tp2, scale)} / {fmt_price(r.tp3, scale)}`"
+                    f"**Entry (D):** `{fmt_price(r.entry_d)}` · "
+                    f"**ATR SL:** `{fmt_price(r.sl)}` · "
+                    f"**TP1:** `{fmt_price(r.tp1)}` · "
+                    f"**TP2/3:** `{fmt_price(r.tp2)} / {fmt_price(r.tp3)}`"
                 )
                 if r.zone_low is not None and r.zone_high is not None:
                     st.caption(
-                        f"{r.zone_label}: {fmt_price(r.zone_low, scale)} – {fmt_price(r.zone_high, scale)} | "
-                        f"Optimal Zone: {fmt_price(r.optimal_zone_low, scale)} – {fmt_price(r.optimal_zone_high, scale)}"
+                        f"{r.zone_label}: {fmt_price(r.zone_low)} – {fmt_price(r.zone_high)} | "
+                        f"Optimal Zone: {fmt_price(r.optimal_zone_low)} – {fmt_price(r.optimal_zone_high)}"
                     )
                 st.caption(
-                    f"Secondary SL: {fmt_price(r.secondary_sl, scale)} | "
-                    f"Support: {fmt_price(r.nearest_support, scale)} | "
-                    f"Resistance: {fmt_price(r.nearest_resistance, scale)} | {r.tp_obstacle_note}"
+                    f"Secondary SL: {fmt_price(r.secondary_sl)} | "
+                    f"Support: {fmt_price(r.nearest_support)} | "
+                    f"Resistance: {fmt_price(r.nearest_resistance)} | {r.tp_obstacle_note}"
                 )
                 for n in r.mtf_notes:
                     st.caption(f"• {n}")
@@ -647,7 +619,7 @@ with pattern_tabs[0]:
                                     "sl_hit": False,
                                     "mtf_notes": r.mtf_notes,
                                     "tp_obstacle_note": r.tp_obstacle_note,
-                                    "last_price": corr_by_coin[r.coin]["kucoin"] or r.last_close,
+                                    "last_price": last_price_by_coin.get(r.coin) or r.last_close,
                                 }
                             )
                             save_active_trades(st.session_state.active_trades)
@@ -662,39 +634,47 @@ with pattern_tabs[0]:
 with pattern_tabs[1]:
     st.info("Additional harmonic patterns will appear in their own tabs here as we add them.")
 
-# 3. STACKED CHARTS (TradingView up, Harmonic/Zone/Wall chart down) + On-Demand AI & Bullet Readout
+# 3. STACKED CHARTS (TradingView BTCUSDT.P default + Harmonic/Zone/Wall chart)
 st.divider()
 st.subheader("Chart & Setup Inspector")
 
 ctl1, ctl2, ctl3 = st.columns([1.4, 1.0, 1.6])
 with ctl1:
-    chart_coin = st.selectbox("Coin", options=list(coins_tuple), index=0)
+    chart_coin = st.selectbox("Swap Coin", options=coins_list, index=0)
 with ctl2:
     chart_tf = st.selectbox("Timeframe", options=selected_tfs, index=0)
 with ctl3:
-    corr_info = corr_by_coin[chart_coin]
-    liq_info = fetch_liquidation_snapshot(chart_coin, corr_info.get("kucoin"))
-    diff_str = f"{corr_info['diff_pct']:+.2f}%" if corr_info["diff_pct"] is not None else "-"
+    live_p_sel = last_price_by_coin.get(chart_coin)
+    liq_info = fetch_liquidation_snapshot(chart_coin, live_p_sel)
     st.metric(
-        label=f"{chart_coin} KuCoin vs Web Ref",
-        value=fmt_price(corr_info["kucoin"]),
-        delta=f"Web {fmt_price(corr_info['web'])} ({diff_str}) · {liq_info['liq_note']}",
+        label=f"{chart_coin}USDT.P Live Swap Price",
+        value=fmt_price(live_p_sel),
+        delta=str(liq_info["liq_note"]),
     )
 
 selected_scan = result_map.get((chart_coin, chart_tf))
 selected_df = df_lookup.get((chart_coin, chart_tf), pd.DataFrame())
-chart_scale = 1.0
-if price_mode == "Web / Reference Adjusted" and corr_info["ratio"]:
-    chart_scale = float(corr_info["ratio"])
+
+ref_price, ref_series = fetch_web_reference_prices(chart_coin, chart_tf, limit=80)
+corr_info = compute_price_correlation(selected_df, ref_series)
+corr_val = corr_info.get("corr")
+spread_val = corr_info.get("spread_pct")
+
+st.caption(
+    f"Swap Feed Correlation ({corr_info.get('label')}): "
+    f"**{corr_val if corr_val is not None else 'N/A'}** | "
+    f"Ref Swap/Price: **{fmt_price(ref_price)}** | "
+    f"Basis Spread: **{f'{spread_val:+.4f}%' if spread_val is not None else 'N/A'}**"
+)
 
 st.markdown("**1. Live TradingView Chart**")
-tv_sym = f"KUCOIN:{to_kucoin_symbol(chart_coin).replace('-', '')}"
+tv_sym = f"BINANCE:{to_perp_symbol(chart_coin).replace('.P', '')}.P"
 render_tradingview_chart(tv_sym, chart_tf, height=430)
 
 st.markdown("**2. Harmonic Legs, Reversal Zone, ATR SL & Support/Resistance Chart**")
 if selected_scan:
     st.plotly_chart(
-        render_pattern_mapping_chart(selected_df, selected_scan, liq_info, chart_scale),
+        render_pattern_mapping_chart(selected_df, selected_scan, liq_info),
         use_container_width=True,
     )
 
@@ -753,12 +733,12 @@ with detail_tabs[0]:
 with detail_tabs[1]:
     if selected_scan:
         bullets = [
-            f"Coin & Timeframe: {selected_scan.coin}/USDT on {selected_scan.timeframe} ({selected_scan.pattern_type or 'NONE'} — {selected_scan.status_label})",
+            f"Swap Contract & Timeframe: {selected_scan.coin}USDT.P on {selected_scan.timeframe} ({selected_scan.pattern_type or 'NONE'} — {selected_scan.status_desc})",
             f"Signal & Score: {selected_scan.sig_code} | Confluence {selected_scan.conf_pct:.1f}% ({selected_scan.conf_score}/3) | Total Score {selected_scan.total_score}/100",
-            f"Entry (D): {fmt_price(selected_scan.entry_d, chart_scale)} | Optimal Zone: {fmt_price(selected_scan.optimal_zone_low, chart_scale)} – {fmt_price(selected_scan.optimal_zone_high, chart_scale)} ({selected_scan.optimal_entry_status})",
-            f"Stop Levels: Primary ATR SL {fmt_price(selected_scan.sl, chart_scale)} | Secondary SL {fmt_price(selected_scan.secondary_sl, chart_scale)} | Bias-Change {fmt_price(selected_scan.bias_change_level, chart_scale)}",
-            f"Targets: TP1 {fmt_price(selected_scan.tp1, chart_scale)} | TP2 {fmt_price(selected_scan.tp2, chart_scale)} | TP3 {fmt_price(selected_scan.tp3, chart_scale)}",
-            f"Walls & Obstacles: Support {fmt_price(selected_scan.nearest_support, chart_scale)} | Resistance {fmt_price(selected_scan.nearest_resistance, chart_scale)} | {selected_scan.tp_obstacle_note}",
+            f"Entry (D): {fmt_price(selected_scan.entry_d)} | Optimal Zone: {fmt_price(selected_scan.optimal_zone_low)} – {fmt_price(selected_scan.optimal_zone_high)} ({selected_scan.optimal_entry_status})",
+            f"Stop Levels: Primary ATR SL {fmt_price(selected_scan.sl)} | Secondary SL {fmt_price(selected_scan.secondary_sl)} | Bias-Change {fmt_price(selected_scan.bias_change_level)}",
+            f"Targets: TP1 {fmt_price(selected_scan.tp1)} | TP2 {fmt_price(selected_scan.tp2)} | TP3 {fmt_price(selected_scan.tp3)}",
+            f"Walls & Obstacles: Support {fmt_price(selected_scan.nearest_support)} | Resistance {fmt_price(selected_scan.nearest_resistance)} | {selected_scan.tp_obstacle_note}",
             f"Score Adjustments: {', '.join(selected_scan.score_adjustments) if selected_scan.score_adjustments else 'None'}",
         ] + [f"MTF Note: {m}" for m in selected_scan.mtf_notes]
         for b in bullets:
@@ -766,16 +746,16 @@ with detail_tabs[1]:
 
 # 4. STATUS TABLE & SIGNAL AUDIT LOGBOOK
 st.divider()
-st.subheader("Status Table (All Coins × Timeframes)")
+st.subheader("Status Table (All Swap Contracts × Timeframes)")
 
 status_records = []
 for sym in symbols_list:
     coin = clean_coin_name(sym)
-    rec: Dict[str, str] = {"Coin": coin}
+    rec: Dict[str, str] = {"Swap": f"{coin}USDT.P"}
     for tf in selected_tfs:
         match = result_map.get((coin, tf))
         if not match or match.status_label == "IDLE":
-            rec[tf] = "Idle (-)"
+            rec[tf] = match.status_desc if match else "Hunting Waves"
         elif match.status_label == "READY TO BE":
             rec[tf] = f"Ready to Be ({match.sig_code} {match.pattern_type[:4]} · {match.total_score})"
         else:
@@ -804,7 +784,7 @@ for tab, horizon in zip(log_tabs, HORIZONS):
         if scoped:
             for i, r in enumerate(scoped[:30], start=1):
                 st.markdown(
-                    f"**#{i} | {r.get('coin')}USDT [{r.get('timeframe')}] {r.get('pattern_type')}** — "
+                    f"**#{i} | {r.get('coin')}USDT.P [{r.get('timeframe')}] {r.get('pattern_type')}** — "
                     f"Outcome: `{r.get('outcome', 'TRACKING')}` · Stage: `{r.get('status_label')}` · "
                     f"Score: `{r.get('total_score', 0)}/100` · Logged: `{r.get('timestamp_pkt')}`  \n"
                     f"Entry: `{fmt_price(r.get('entry_d'))}` | ATR SL: `{fmt_price(r.get('sl'))}` | "
@@ -813,7 +793,6 @@ for tab, horizon in zip(log_tabs, HORIZONS):
         else:
             st.info("No logged signals for this window yet.")
 
-# Non-blocking lightweight auto-refresh via meta refresh (avoids time.sleep freeze)
 if auto_refresh:
     components.html(
         f"<script>setTimeout(function(){{ window.parent.location.reload(); }}, {int(refresh_sec) * 1000});</script>",
