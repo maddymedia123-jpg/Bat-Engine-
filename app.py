@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -25,6 +25,7 @@ from market_data import (
 )
 from turso_store import (
     HORIZONS,
+    audit_and_correlate_summary,
     filter_logbook_records,
     init_storage,
     load_active_trades,
@@ -35,7 +36,7 @@ from turso_store import (
     run_on_demand_trader_agent,
     save_active_trades,
     save_summary,
-    silent_self_audit_and_update,
+    send_discord_webhook_alert,
     turso_configured,
 )
 
@@ -55,6 +56,54 @@ def format_tf_counts(items: List[BatScanResult], tfs: List[str]) -> str:
         count = sum(1 for item in items if item.timeframe == tf)
         parts.append(f"{tf} ({count})")
     return " · ".join(parts)
+
+
+def evaluate_sl_and_tp_posture(trade: Dict[str, object]) -> Tuple[str, Optional[float], str]:
+    """
+    Determines when to keep Primary SL, switch to Secondary SL, or shift SL to
+    Break-Even and focus on TP2.
+    """
+    direction = str(trade.get("pattern_type") or "BULLISH")
+    live_p = trade.get("last_price")
+    entry_p = trade.get("entry_d")
+    primary_sl = trade.get("sl")
+    secondary_sl = trade.get("secondary_sl")
+    be_sl = trade.get("break_even_sl") or entry_p
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    sl_hit = bool(trade.get("sl_hit", False))
+
+    if sl_hit:
+        return "SL HIT", primary_sl if isinstance(primary_sl, (int, float)) else None, "Trade hit SL — halt new adds."
+
+    if tp2_hit:
+        be_val = float(be_sl) if isinstance(be_sl, (int, float)) else (float(entry_p) if isinstance(entry_p, (int, float)) else None)
+        return "BREAK-EVEN SL (TP3 FOCUS)", be_val, "TP2 hit — protect Break-Even SL and aim for TP3."
+
+    if tp1_hit:
+        be_val = float(be_sl) if isinstance(be_sl, (int, float)) else (float(entry_p) if isinstance(entry_p, (int, float)) else None)
+        return (
+            "SHIFT SL TO BREAK-EVEN -> LOOK FOR TP2",
+            be_val,
+            "TP1 secured — shift SL to Break-Even and target TP2.",
+        )
+
+    fav_move = False
+    if isinstance(live_p, (int, float)) and isinstance(entry_p, (int, float)):
+        fav_move = (direction == "BULLISH" and live_p > entry_p) or (direction == "BEARISH" and live_p < entry_p)
+
+    if fav_move and isinstance(secondary_sl, (int, float)):
+        return (
+            "SECONDARY SL (TRAILING)",
+            float(secondary_sl),
+            "Price moving in favor before TP1 — trail with Secondary SL.",
+        )
+
+    return (
+        "PRIMARY SL",
+        float(primary_sl) if isinstance(primary_sl, (int, float)) else None,
+        "Hold Primary ATR SL until price favors trade or hits TP1.",
+    )
 
 
 def compute_tp_progress(
@@ -108,6 +157,7 @@ def render_pattern_mapping_chart(
     df: pd.DataFrame,
     res: BatScanResult,
     liq_info: Dict[str, Optional[float] | str],
+    is_committed: bool = False,
 ) -> go.Figure:
     fig = go.Figure()
     if df is None or df.empty:
@@ -167,7 +217,7 @@ def render_pattern_mapping_chart(
                 )
             )
 
-    if res.zone_low is not None and res.zone_high is not None:
+    if not is_committed and res.zone_low is not None and res.zone_high is not None:
         fig.add_hrect(
             y0=res.zone_low,
             y1=res.zone_high,
@@ -179,11 +229,18 @@ def render_pattern_mapping_chart(
         )
 
     if res.entry_d is not None:
-        fig.add_hline(y=res.entry_d, line_dash="dash", line_color="#FFD54F", annotation_text="Entry (D)")
+        fig.add_hline(
+            y=res.entry_d,
+            line_dash="dash",
+            line_color="#FFD54F",
+            annotation_text="Committed Entry" if is_committed else "Optimal Entry (D)",
+        )
     if res.sl is not None:
-        fig.add_hline(y=res.sl, line_dash="solid", line_color="#FF3B3B", annotation_text="ATR SL")
+        fig.add_hline(y=res.sl, line_dash="solid", line_color="#FF3B3B", annotation_text="Primary ATR SL")
     if res.secondary_sl is not None:
         fig.add_hline(y=res.secondary_sl, line_dash="dashdot", line_color="#FF9800", annotation_text="Secondary SL")
+    if res.break_even_sl is not None and is_committed:
+        fig.add_hline(y=res.break_even_sl, line_dash="longdash", line_color="#00E5FF", annotation_text="Break-Even SL")
     if res.bias_change_level is not None:
         fig.add_hline(y=res.bias_change_level, line_dash="longdash", line_color="#AB47BC", annotation_text="Bias-Change")
     if res.nearest_support is not None:
@@ -260,8 +317,17 @@ with st.sidebar:
     refresh_sec = st.slider("Fragment update interval (sec)", min_value=15, max_value=180, value=30, step=5)
 
     st.divider()
+    st.subheader("Discord Bot Webhook")
+    discord_webhook_url = st.text_input(
+        "Discord Webhook URL (or set DISCORD_WEBHOOK_URL in Secrets)",
+        type="password",
+        placeholder="https://discord.com/api/webhooks/...",
+    ).strip()
+    discord_enabled = st.checkbox("Enable Discord Bot Alerts", value=True)
+
+    st.divider()
     st.subheader("AI Agent Key (On-Demand Only)")
-    ai_api_key_raw = st.text_input("AI API Key Override (Optional)", type="password", placeholder="sk-...")
+    ai_api_key_raw = st.text_input("AI API Key Override (Optional)", type="password", placeholder="sk-or-v1-...")
     ai_api_key = ai_api_key_raw.strip()
 
     st.divider()
@@ -304,7 +370,7 @@ params = {
 }
 
 st.title("Harmonics Engine")
-st.caption("Pine v6 BatPattern engine on swap futures (defaulting to BTCUSDT.P) with ATR SL, price correlation display, Turso persistence, and non-blocking updates.")
+st.caption("Pine v6 BatPattern engine on swap futures (defaulting to BTCUSDT.P) with ATR SL, self-auditing AI memory, and Discord bot alerts.")
 
 coins_list = [clean_coin_name(s) for s in symbols_list]
 last_price_by_coin: Dict[str, Optional[float]] = {}
@@ -329,8 +395,25 @@ for tf in selected_tfs:
         results.append(run_bat_engine(df, sym, coin, tf, params))
 
 results = enrich_multi_timeframe_context(results)
+
+# Deduplicated & strictly validated result list (deduped_results)
+deduped_results: List[BatScanResult] = []
+seen_pairs = set()
+for r in results:
+    expected_coin = clean_coin_name(r.symbol)
+    if r.coin != expected_coin or r.timeframe not in selected_tfs:
+        continue
+    pair_key = (r.coin, r.timeframe)
+    if pair_key in seen_pairs:
+        continue
+    seen_pairs.add(pair_key)
+    deduped_results.append(r)
+
+results = deduped_results
 st.session_state.logbook = record_generated_signals(st.session_state.logbook, results)
 result_map: Dict[tuple, BatScanResult] = {(r.coin, r.timeframe): r for r in results}
+
+committed_keys = {(t.get("coin"), t.get("timeframe")) for t in st.session_state.active_trades}
 
 trades_changed = False
 for trade in st.session_state.active_trades:
@@ -351,6 +434,7 @@ for trade in st.session_state.active_trades:
         trade["beyond_optimal_entry"] = latest_scan.beyond_optimal_entry
         trade["optimal_entry_status"] = latest_scan.optimal_entry_status
         trade["secondary_sl"] = latest_scan.secondary_sl
+        trade["break_even_sl"] = latest_scan.break_even_sl or trade.get("entry_d")
         trade["bias_change_level"] = latest_scan.bias_change_level
         trade["mtf_notes"] = latest_scan.mtf_notes
         trade["tp_obstacle_note"] = latest_scan.tp_obstacle_note
@@ -383,17 +467,126 @@ for trade in st.session_state.active_trades:
                 trade["sl_hit"] = True
                 trades_changed = True
 
+    sl_mode, active_sl_val, sl_action_note = evaluate_sl_and_tp_posture(trade)
+    trade["sl_mode"] = sl_mode
+    trade["active_sl_guidance"] = active_sl_val
+    trade["sl_action_note"] = sl_action_note
+
 if trades_changed:
     save_active_trades(st.session_state.active_trades)
 
 
+def _dispatch_discord_for_trade_state(trade: Dict[str, object], summary_text: Optional[str] = None) -> None:
+    if not discord_enabled:
+        return
+    coin = str(trade.get("coin", ""))
+    tf = str(trade.get("timeframe", ""))
+    direction = str(trade.get("pattern_type", ""))
+    live_p = trade.get("last_price")
+    sl_mode = str(trade.get("sl_mode") or "PRIMARY SL")
+    active_sl = trade.get("active_sl_guidance")
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    tp3_hit = bool(trade.get("tp3_hit", False))
+    sl_hit = bool(trade.get("sl_hit", False))
+    bad_confs = trade.get("bad_confluences") or []
+    wall = str(trade.get("tp_obstacle_note") or "Clear path")
+
+    base_fields = [
+        {"name": "Pair / TF", "value": f"{coin}USDT.P [{tf}] ({direction})", "inline": True},
+        {"name": "Live Price", "value": fmt_price(live_p if isinstance(live_p, (int, float)) else None), "inline": True},
+        {"name": "SL Mode", "value": f"{sl_mode} ({fmt_price(active_sl if isinstance(active_sl, (int, float)) else None)})", "inline": True},
+        {"name": "TP1 / TP2 / TP3", "value": f"{fmt_price(trade.get('tp1'))} / {fmt_price(trade.get('tp2'))} / {fmt_price(trade.get('tp3'))}", "inline": True},
+        {"name": "Action Plan", "value": str(trade.get("sl_action_note") or "-"), "inline": False},
+    ]
+
+    if summary_text:
+        send_discord_webhook_alert(
+            event_key=f"summary_{coin}_{tf}_{sl_mode}",
+            title=f"AI Summary & Posture — {coin}USDT.P [{tf}]",
+            description=summary_text[:1800],
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0x3B82F6,
+            force=True,
+        )
+
+    if sl_hit:
+        send_discord_webhook_alert(
+            event_key=f"sl_hit_{coin}_{tf}",
+            title=f"STOP LOSS HIT — {coin}USDT.P [{tf}]",
+            description=f"Price triggered SL on {coin} [{tf}] {direction}.",
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0xEF4444,
+        )
+    elif tp3_hit:
+        send_discord_webhook_alert(
+            event_key=f"tp3_hit_{coin}_{tf}",
+            title=f"TP3 HIT — {coin}USDT.P [{tf}]",
+            description=f"Final target TP3 reached on {coin} [{tf}] {direction}.",
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0x10B981,
+        )
+    elif tp2_hit:
+        send_discord_webhook_alert(
+            event_key=f"tp2_hit_{coin}_{tf}",
+            title=f"TP2 HIT -> TRAIL / TP3 — {coin}USDT.P [{tf}]",
+            description=f"TP2 hit on {coin} [{tf}] {direction}. Protect Break-Even SL and look for TP3.",
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0x22C55E,
+        )
+    elif tp1_hit:
+        send_discord_webhook_alert(
+            event_key=f"tp1_hit_{coin}_{tf}",
+            title=f"TP1 HIT -> SHIFT SL TO BREAK-EVEN & TARGET TP2 — {coin}USDT.P [{tf}]",
+            description=f"TP1 hit on {coin} [{tf}] {direction}. Shift SL to Break-Even and look for TP2.",
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0x00C853,
+        )
+    elif sl_mode == "SECONDARY SL (TRAILING)":
+        send_discord_webhook_alert(
+            event_key=f"sec_sl_{coin}_{tf}",
+            title=f"SL TRANSITION: SECONDARY SL — {coin}USDT.P [{tf}]",
+            description=f"Price moved favorably; switch from Primary SL to Secondary SL ({fmt_price(active_sl if isinstance(active_sl, (int, float)) else None)}).",
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0xF59E0B,
+        )
+
+    if bad_confs or (wall != "Clear path"):
+        warn_reasons = list(bad_confs) + ([wall] if wall != "Clear path" else [])
+        send_discord_webhook_alert(
+            event_key=f"warn_{coin}_{tf}_{'|'.join(warn_reasons)}",
+            title=f"PRICE / CONFLUENCE WARNING — {coin}USDT.P [{tf}]",
+            description=" | ".join(warn_reasons),
+            fields=base_fields,
+            webhook_url_override=discord_webhook_url,
+            color=0xF97316,
+        )
+
+
+for tr in st.session_state.active_trades:
+    _dispatch_discord_for_trade_state(tr, summary_text=None)
+
+
 def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, target_ctx: Dict[str, object]) -> None:
-    st.session_state.audit_logs = silent_self_audit_and_update(
-        st.session_state.audit_logs,
-        st.session_state.active_trades,
-        st.session_state.logbook,
-    )
     t_key = f"{target_coin}_{target_tf}"
+    prev_summary = st.session_state.ai_summaries.get(t_key)
+
+    st.session_state.audit_logs, t_audit = audit_and_correlate_summary(
+        existing_audits=st.session_state.audit_logs,
+        target_coin=target_coin,
+        target_tf=target_tf,
+        setup_context=target_ctx,
+        previous_summary=prev_summary,
+        active_trades=st.session_state.active_trades,
+        logbook=st.session_state.logbook,
+    )
+
     t_summary = run_on_demand_trader_agent(
         target_coin=target_coin,
         target_tf=target_tf,
@@ -401,14 +594,42 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
         all_committed_trades=st.session_state.active_trades,
         audit_history=st.session_state.audit_logs,
         api_key=ai_api_key,
+        previous_summary=prev_summary,
+        audit_entry=t_audit,
     )
     st.session_state.ai_summaries[t_key] = t_summary
     save_summary(t_key, target_coin, target_tf, t_summary)
 
+    if discord_enabled:
+        send_discord_webhook_alert(
+            event_key=f"agent_run_{t_key}_{t_audit.get('accuracy_pct')}",
+            title=f"AI Agent Update (Acc {t_audit.get('accuracy_pct')}%) — {target_coin}USDT.P [{target_tf}]",
+            description=t_summary[:1800],
+            fields=[
+                {"name": "SL Posture", "value": str(target_ctx.get("sl_mode") or "PRIMARY SL"), "inline": True},
+                {"name": "Active SL", "value": fmt_price(target_ctx.get("active_sl_guidance") if isinstance(target_ctx.get("active_sl_guidance"), (int, float)) else target_ctx.get("sl")), "inline": True},
+            ],
+            webhook_url_override=discord_webhook_url,
+            color=0x6366F1,
+            force=True,
+        )
+
     for tr in st.session_state.active_trades:
-        c = tr.get("coin", "")
-        tf = tr.get("timeframe", "")
+        c = str(tr.get("coin", ""))
+        tf = str(tr.get("timeframe", ""))
+        if not c or not tf or (c == target_coin and tf == target_tf):
+            continue
         ckey = f"{c}_{tf}"
+        c_prev = st.session_state.ai_summaries.get(ckey)
+        st.session_state.audit_logs, c_audit = audit_and_correlate_summary(
+            existing_audits=st.session_state.audit_logs,
+            target_coin=c,
+            target_tf=tf,
+            setup_context=tr,
+            previous_summary=c_prev,
+            active_trades=st.session_state.active_trades,
+            logbook=st.session_state.logbook,
+        )
         csum = run_on_demand_trader_agent(
             target_coin=c,
             target_tf=tf,
@@ -416,12 +637,14 @@ def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, tar
             all_committed_trades=st.session_state.active_trades,
             audit_history=st.session_state.audit_logs,
             api_key=ai_api_key,
+            previous_summary=c_prev,
+            audit_entry=c_audit,
         )
         st.session_state.ai_summaries[ckey] = csum
         save_summary(ckey, c, tf, csum)
 
 
-# 1. ACTIVE TRADE MONITORING TERMINAL
+# 1. ACTIVE TRADE MONITORING TERMINAL (Committed trades follow SL -> Secondary SL -> Break-Even -> TP2)
 def _render_active_monitor_body() -> None:
     st.subheader(f"Active Trade Monitoring Terminal ({len(st.session_state.active_trades)} / 10 Locked)")
     if st.session_state.active_trades:
@@ -442,6 +665,12 @@ def _render_active_monitor_body() -> None:
                     tf = trade["timeframe"]
                     direction = trade["pattern_type"]
                     live_p = fetch_perp_last_price(to_perp_symbol(coin)) or trade.get("last_price")
+                    trade["last_price"] = live_p
+                    sl_mode, active_sl_val, sl_action_note = evaluate_sl_and_tp_posture(trade)
+                    trade["sl_mode"] = sl_mode
+                    trade["active_sl_guidance"] = active_sl_val
+                    trade["sl_action_note"] = sl_action_note
+
                     entry_p = trade.get("entry_d")
                     sl_p = trade.get("sl")
                     tp1_p, tp2_p, tp3_p = trade.get("tp1"), trade.get("tp2"), trade.get("tp3")
@@ -452,18 +681,19 @@ def _render_active_monitor_body() -> None:
                     s_key = f"{coin}_{tf}"
 
                     with st.container(border=True):
-                        c1, c2, c3, c4, c5 = st.columns([1.7, 1.9, 2.6, 2.0, 0.9])
+                        c1, c2, c3, c4, c5 = st.columns([1.7, 2.1, 2.5, 2.0, 0.9])
                         with c1:
                             st.markdown(f"### {coin}USDT.P · `{tf}`")
                             st.markdown(f"**{direction}** · `{trade.get('sig_code', 'C')}` ({trade.get('conf_pct', 0.0):.0f}%)")
                             st.caption(f"Score: **{trade.get('total_score', 0)}/100**")
+                            st.caption("COMMITTED (Optimal entry hidden)")
 
                         with c2:
                             st.markdown(f"**Live:** {fmt_price(live_p)}")
-                            st.markdown(f"**Entry:** {fmt_price(entry_p)}")
-                            st.markdown(f"**ATR SL (Main):** {fmt_price(sl_p)}")
-                            st.caption(f"Secondary SL: {fmt_price(trade.get('secondary_sl'))}")
-                            st.caption(f"Bias-Change: {fmt_price(trade.get('bias_change_level'))}")
+                            st.markdown(f"**Committed Entry:** {fmt_price(entry_p)}")
+                            st.markdown(f"**Active SL ({sl_mode}):** `{fmt_price(active_sl_val)}`")
+                            st.caption(f"Primary SL: {fmt_price(sl_p)} | Secondary SL: {fmt_price(trade.get('secondary_sl'))}")
+                            st.caption(f"Break-Even SL: {fmt_price(trade.get('break_even_sl'))}")
 
                         with c3:
                             if sl_hit and not any_tp_hit:
@@ -491,11 +721,7 @@ def _render_active_monitor_body() -> None:
                                     st.progress(int(round(prog)), text=f"{tp_label} ({fmt_price(tp_val)}): {prog:.0f}% · {eta_str}")
 
                         with c4:
-                            if trade.get("beyond_optimal_entry"):
-                                st.warning(f"Beyond Optimal Entry: {trade.get('optimal_entry_status')}")
-                            else:
-                                st.caption(f"Entry Zone Status: {trade.get('optimal_entry_status')}")
-
+                            st.info(sl_action_note)
                             if trade.get("bad_confluences"):
                                 st.error("Confluence Warning: " + ", ".join(trade["bad_confluences"]))
                             else:
@@ -515,8 +741,8 @@ def _render_active_monitor_body() -> None:
                                 st.rerun()
 
                         has_sum = s_key in st.session_state.ai_summaries
-                        btn_lbl = "Re-run AI Summary (Committed Sync)" if has_sum else "Run AI Summary (On-Demand)"
-                        with st.expander(f"AI Trader Summary & Self-Audit — {coin} [{tf}]", expanded=False):
+                        btn_lbl = "Re-run & Correlate AI Summary" if has_sum else "Run AI Summary (On-Demand)"
+                        with st.expander(f"AI Trader Summary & Self-Audit Memory — {coin} [{tf}]", expanded=False):
                             b_col1, b_col2, b_col3 = st.columns([1.4, 1.2, 1.4])
                             with b_col1:
                                 if st.button(btn_lbl, key=f"run_ai_tr_{tab_idx}_{idx}_{coin}_{tf}"):
@@ -535,17 +761,16 @@ def _render_active_monitor_body() -> None:
                             if st.session_state.show_summary_toggle and has_sum:
                                 st.info(st.session_state.ai_summaries[s_key])
                             elif not has_sum:
-                                st.caption("No summary run yet. Click **Run AI Summary** to generate & save in Turso.")
+                                st.caption("No summary run yet. Click **Run AI Summary** to generate, audit memory, & save.")
 
                             if show_audit:
-                                if st.session_state.audit_logs:
-                                    for a in st.session_state.audit_logs[:8]:
-                                        st.caption(
-                                            f"• [{a.get('audited_pkt')}] {a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
-                                            f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
-                                        )
-                                else:
-                                    st.caption("Self-audit log updates automatically whenever you run a summary.")
+                                matching_audits = [a for a in st.session_state.audit_logs if a.get("coin") == coin and a.get("timeframe") == tf] or st.session_state.audit_logs
+                                for a in matching_audits[:8]:
+                                    st.caption(
+                                        f"• [{a.get('audited_pkt')}] Acc: **{a.get('accuracy_pct', 75.0)}%** · "
+                                        f"{a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
+                                        f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
+                                    )
     else:
         st.info("No active trades locked yet. Lock a CONFIRMED signal from the Bat Pattern tab below.")
 
@@ -559,7 +784,7 @@ if auto_refresh and hasattr(st, "fragment"):
 else:
     _render_active_monitor_body()
 
-# 2. PATTERN TABS
+# 2. PATTERN TABS (Shows Optimal Entry only when uncommitted)
 st.divider()
 pattern_tabs = st.tabs(["Bat Pattern", "More Patterns (Soon)"])
 
@@ -567,9 +792,9 @@ with pattern_tabs[0]:
     col_ready, col_conf = st.columns(2)
 
     ready_items = [
-        r for r in results if r.status_label == "READY TO BE" and (show_overstretched or not r.overstretched)
+        r for r in deduped_results if r.status_label == "READY TO BE" and (show_overstretched or not r.overstretched)
     ]
-    conf_items = [r for r in results if r.status_label == "CONFIRMED"]
+    conf_items = [r for r in deduped_results if r.status_label == "CONFIRMED"]
 
     def render_signal_panel(title: str, items: List[BatScanResult], is_confirmed: bool) -> None:
         st.subheader(f"{title} ({len(items)})")
@@ -580,6 +805,7 @@ with pattern_tabs[0]:
 
         for idx, r in enumerate(items):
             badge_color = "#00C853" if r.pattern_type == "BULLISH" else "#FF3B3B"
+            is_committed_already = (r.coin, r.timeframe) in committed_keys
             with st.container(border=True):
                 st.markdown(
                     f"<span style='color:{badge_color};font-weight:700;'>{r.coin}USDT.P · {r.pattern_type} · [{r.timeframe}]</span> "
@@ -588,65 +814,84 @@ with pattern_tabs[0]:
                 )
                 st.markdown(
                     f"**Entry (D):** `{fmt_price(r.entry_d)}` · "
-                    f"**ATR SL:** `{fmt_price(r.sl)}` · "
+                    f"**Primary ATR SL:** `{fmt_price(r.sl)}` · "
                     f"**TP1:** `{fmt_price(r.tp1)}` · "
                     f"**TP2/3:** `{fmt_price(r.tp2)} / {fmt_price(r.tp3)}`"
                 )
-                if r.zone_low is not None and r.zone_high is not None:
+                if not is_committed_already and r.zone_low is not None and r.zone_high is not None:
                     st.caption(
-                        f"{r.zone_label}: {fmt_price(r.zone_low)} – {fmt_price(r.zone_high)} | "
-                        f"Optimal Zone: {fmt_price(r.optimal_zone_low)} – {fmt_price(r.optimal_zone_high)}"
+                        f"**Optimal Entry Zone:** {fmt_price(r.optimal_zone_low)} – {fmt_price(r.optimal_zone_high)} "
+                        f"({r.optimal_entry_status}) | {r.zone_label}: {fmt_price(r.zone_low)} – {fmt_price(r.zone_high)}"
                     )
+                elif is_committed_already:
+                    st.caption("Trade committed — optimal entry prompt hidden; following active trade plan above.")
+
                 st.caption(
-                    f"Secondary SL: {fmt_price(r.secondary_sl)} | "
-                    f"Support: {fmt_price(r.nearest_support)} | "
-                    f"Resistance: {fmt_price(r.nearest_resistance)} | {r.tp_obstacle_note}"
+                    f"Secondary SL: {fmt_price(r.secondary_sl)} | Break-Even SL: {fmt_price(r.break_even_sl)} | "
+                    f"Support: {fmt_price(r.nearest_support)} | Resistance: {fmt_price(r.nearest_resistance)} | {r.tp_obstacle_note}"
                 )
                 for n in r.mtf_notes:
                     st.caption(f"• {n}")
 
-                if r.beyond_optimal_entry:
+                if not is_committed_already and r.beyond_optimal_entry:
                     st.warning(f"Beyond Optimal Entry: {r.optimal_entry_status}")
                 if r.bad_confluences:
                     st.caption("Confluence flags: " + ", ".join(r.bad_confluences))
 
                 if is_confirmed:
-                    if st.button(f"Lock [{r.timeframe}] {r.coin} into Active Trades", key=f"lock_{r.coin}_{r.timeframe}_{r.pattern_type}_{idx}"):
-                        already = any(
-                            t["coin"] == r.coin and t["timeframe"] == r.timeframe and t["pattern_type"] == r.pattern_type
-                            for t in st.session_state.active_trades
-                        )
-                        if not already:
-                            st.session_state.active_trades.append(
-                                {
-                                    "coin": r.coin,
-                                    "timeframe": r.timeframe,
-                                    "pattern_type": r.pattern_type,
-                                    "sig_code": r.sig_code,
-                                    "conf_score": r.conf_score,
-                                    "conf_pct": r.conf_pct,
-                                    "total_score": r.total_score,
-                                    "bad_confluences": r.bad_confluences,
-                                    "beyond_optimal_entry": r.beyond_optimal_entry,
-                                    "optimal_entry_status": r.optimal_entry_status,
-                                    "entry_d": r.entry_d,
-                                    "sl": r.sl,
-                                    "secondary_sl": r.secondary_sl,
-                                    "bias_change_level": r.bias_change_level,
-                                    "tp1": r.tp1,
-                                    "tp2": r.tp2,
-                                    "tp3": r.tp3,
-                                    "tp1_hit": r.tp1_hit,
-                                    "tp2_hit": r.tp2_hit,
-                                    "tp3_hit": False,
-                                    "sl_hit": False,
-                                    "mtf_notes": r.mtf_notes,
-                                    "tp_obstacle_note": r.tp_obstacle_note,
-                                    "last_price": last_price_by_coin.get(r.coin) or r.last_close,
-                                }
+                    if is_committed_already:
+                        st.success(f"Committed in Active Trades ({r.coin} [{r.timeframe}])")
+                    elif st.button(f"Lock [{r.timeframe}] {r.coin} into Active Trades", key=f"lock_{r.coin}_{r.timeframe}_{r.pattern_type}_{idx}"):
+                        new_trade: Dict[str, object] = {
+                            "coin": r.coin,
+                            "timeframe": r.timeframe,
+                            "pattern_type": r.pattern_type,
+                            "sig_code": r.sig_code,
+                            "conf_score": r.conf_score,
+                            "conf_pct": r.conf_pct,
+                            "total_score": r.total_score,
+                            "bad_confluences": r.bad_confluences,
+                            "beyond_optimal_entry": r.beyond_optimal_entry,
+                            "optimal_entry_status": r.optimal_entry_status,
+                            "entry_d": r.entry_d,
+                            "sl": r.sl,
+                            "secondary_sl": r.secondary_sl,
+                            "break_even_sl": r.break_even_sl or r.entry_d,
+                            "bias_change_level": r.bias_change_level,
+                            "tp1": r.tp1,
+                            "tp2": r.tp2,
+                            "tp3": r.tp3,
+                            "tp1_hit": r.tp1_hit,
+                            "tp2_hit": r.tp2_hit,
+                            "tp3_hit": False,
+                            "sl_hit": False,
+                            "mtf_notes": r.mtf_notes,
+                            "tp_obstacle_note": r.tp_obstacle_note,
+                            "last_price": last_price_by_coin.get(r.coin) or r.last_close,
+                        }
+                        sl_m, a_sl, s_note = evaluate_sl_and_tp_posture(new_trade)
+                        new_trade["sl_mode"] = sl_m
+                        new_trade["active_sl_guidance"] = a_sl
+                        new_trade["sl_action_note"] = s_note
+
+                        st.session_state.active_trades.append(new_trade)
+                        save_active_trades(st.session_state.active_trades)
+
+                        if discord_enabled:
+                            send_discord_webhook_alert(
+                                event_key=f"locked_{r.coin}_{r.timeframe}_{r.pattern_type}_{r.entry_d}",
+                                title=f"ACTIVE SIGNAL LOCKED — {r.coin}USDT.P [{r.timeframe}]",
+                                description=f"{r.pattern_type} `{r.sig_code}` locked at Entry `{fmt_price(r.entry_d)}`.",
+                                fields=[
+                                    {"name": "Primary SL", "value": fmt_price(r.sl), "inline": True},
+                                    {"name": "Secondary SL", "value": fmt_price(r.secondary_sl), "inline": True},
+                                    {"name": "TP1 / TP2 / TP3", "value": f"{fmt_price(r.tp1)} / {fmt_price(r.tp2)} / {fmt_price(r.tp3)}", "inline": False},
+                                ],
+                                webhook_url_override=discord_webhook_url,
+                                color=0x00C853 if r.pattern_type == "BULLISH" else 0xFF3B3B,
+                                force=True,
                             )
-                            save_active_trades(st.session_state.active_trades)
-                            st.rerun()
+                        st.rerun()
 
     with col_ready:
         render_signal_panel("Ready to Be Panel", ready_items, is_confirmed=False)
@@ -657,7 +902,7 @@ with pattern_tabs[0]:
 with pattern_tabs[1]:
     st.info("Additional harmonic patterns will appear in their own tabs here as we add them.")
 
-# 3. STACKED CHARTS (TradingView BTCUSDT.P default + Harmonic/Zone/Wall chart)
+# 3. STACKED CHARTS
 st.divider()
 st.subheader("Chart & Setup Inspector")
 
@@ -677,6 +922,7 @@ with ctl3:
 
 selected_scan = result_map.get((chart_coin, chart_tf))
 selected_df = df_lookup.get((chart_coin, chart_tf), pd.DataFrame())
+is_selected_committed = (chart_coin, chart_tf) in committed_keys
 
 ref_price, ref_series = fetch_web_reference_prices(chart_coin, chart_tf, limit=80)
 corr_info = compute_price_correlation(selected_df, ref_series)
@@ -697,7 +943,7 @@ render_tradingview_chart(tv_sym, chart_tf, height=430)
 st.markdown("**2. Harmonic Legs, Reversal Zone, ATR SL & Support/Resistance Chart**")
 if selected_scan:
     st.plotly_chart(
-        render_pattern_mapping_chart(selected_df, selected_scan, liq_info),
+        render_pattern_mapping_chart(selected_df, selected_scan, liq_info, is_committed=is_selected_committed),
         use_container_width=True,
     )
 
@@ -707,25 +953,37 @@ with detail_tabs[0]:
     if selected_scan:
         c_key = f"{selected_scan.coin}_{selected_scan.timeframe}"
         has_csum = c_key in st.session_state.ai_summaries
+        matched_trade = next(
+            (t for t in st.session_state.active_trades if t.get("coin") == selected_scan.coin and t.get("timeframe") == selected_scan.timeframe),
+            None,
+        )
         a_col1, a_col2, a_col3 = st.columns([1.5, 1.2, 1.3])
         with a_col1:
             if st.button(
-                "Re-run AI Summary (Sync Committed)" if has_csum else "Run AI Summary (On-Demand)",
+                "Re-run & Correlate AI Summary" if has_csum else "Run AI Summary (On-Demand)",
                 key="btn_chart_ai_agent",
             ):
-                ctx_payload = {
+                ctx_payload: Dict[str, object] = {
                     "coin": selected_scan.coin,
                     "timeframe": selected_scan.timeframe,
                     "pattern_type": selected_scan.pattern_type,
                     "status_label": selected_scan.status_label,
+                    "sig_code": selected_scan.sig_code,
                     "conf_pct": selected_scan.conf_pct,
                     "total_score": selected_scan.total_score,
                     "entry_d": selected_scan.entry_d,
                     "sl": selected_scan.sl,
                     "secondary_sl": selected_scan.secondary_sl,
+                    "break_even_sl": selected_scan.break_even_sl,
                     "bias_change_level": selected_scan.bias_change_level,
                     "tp_obstacle_note": selected_scan.tp_obstacle_note,
+                    "bad_confluences": selected_scan.bad_confluences,
                     "mtf_notes": selected_scan.mtf_notes,
+                    "sl_mode": matched_trade.get("sl_mode") if matched_trade else "PRIMARY SL",
+                    "active_sl_guidance": matched_trade.get("active_sl_guidance") if matched_trade else selected_scan.sl,
+                    "tp1_hit": matched_trade.get("tp1_hit", False) if matched_trade else False,
+                    "tp2_hit": matched_trade.get("tp2_hit", False) if matched_trade else False,
+                    "sl_hit": matched_trade.get("sl_hit", False) if matched_trade else False,
                 }
                 trigger_agent_for_committed_and_target(selected_scan.coin, selected_scan.timeframe, ctx_payload)
                 st.rerun()
@@ -741,13 +999,14 @@ with detail_tabs[0]:
         if st.session_state.show_summary_toggle and has_csum:
             st.info(st.session_state.ai_summaries[c_key])
         elif not has_csum:
-            st.caption("Click **Run AI Summary** to generate a layman institutional opinion and sync across committed trades.")
+            st.caption("Click **Run AI Summary** to generate, correlate with memory, & save.")
 
         if show_chart_audit:
             if st.session_state.audit_logs:
                 for a in st.session_state.audit_logs[:8]:
                     st.caption(
-                        f"• [{a.get('audited_pkt')}] {a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
+                        f"• [{a.get('audited_pkt')}] Acc: **{a.get('accuracy_pct', 75.0)}%** · "
+                        f"{a.get('coin')} {a.get('timeframe')} ({a.get('outcome_seen')}): "
                         f"{a.get('lesson_learned')} | Rule: {a.get('rule_adjustment')}"
                     )
             else:
@@ -758,8 +1017,15 @@ with detail_tabs[1]:
         bullets = [
             f"Swap Contract & Timeframe: {selected_scan.coin}USDT.P on {selected_scan.timeframe} ({selected_scan.pattern_type or 'NONE'} — {selected_scan.status_desc})",
             f"Signal & Score: {selected_scan.sig_code} | Confluence {selected_scan.conf_pct:.1f}% ({selected_scan.conf_score}/3) | Total Score {selected_scan.total_score}/100",
-            f"Entry (D): {fmt_price(selected_scan.entry_d)} | Optimal Zone: {fmt_price(selected_scan.optimal_zone_low)} – {fmt_price(selected_scan.optimal_zone_high)} ({selected_scan.optimal_entry_status})",
-            f"Stop Levels: Primary ATR SL {fmt_price(selected_scan.sl)} | Secondary SL {fmt_price(selected_scan.secondary_sl)} | Bias-Change {fmt_price(selected_scan.bias_change_level)}",
+        ]
+        if not is_selected_committed:
+            bullets.append(
+                f"Entry (D): {fmt_price(selected_scan.entry_d)} | Optimal Zone: {fmt_price(selected_scan.optimal_zone_low)} – {fmt_price(selected_scan.optimal_zone_high)} ({selected_scan.optimal_entry_status})"
+            )
+        else:
+            bullets.append(f"Committed Entry: {fmt_price(selected_scan.entry_d)} (Optimal entry hidden for committed trade)")
+        bullets += [
+            f"Stop Levels: Primary ATR SL {fmt_price(selected_scan.sl)} | Secondary SL {fmt_price(selected_scan.secondary_sl)} | Break-Even SL {fmt_price(selected_scan.break_even_sl)} | Bias-Change {fmt_price(selected_scan.bias_change_level)}",
             f"Targets: TP1 {fmt_price(selected_scan.tp1)} | TP2 {fmt_price(selected_scan.tp2)} | TP3 {fmt_price(selected_scan.tp3)}",
             f"Walls & Obstacles: Support {fmt_price(selected_scan.nearest_support)} | Resistance {fmt_price(selected_scan.nearest_resistance)} | {selected_scan.tp_obstacle_note}",
             f"Score Adjustments: {', '.join(selected_scan.score_adjustments) if selected_scan.score_adjustments else 'None'}",
