@@ -1,19 +1,28 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
 KUCOIN_BASE_URL = "https://api.kucoin.com"
+PKT_TZ = ZoneInfo("Asia/Karachi")
 
-# Initial timeframes: 1H, 2H, 4H, 1D (easy to expand later)
 TIMEFRAME_OPTIONS: Dict[str, str] = {
     "1H": "1hour",
     "2H": "2hour",
     "4H": "4hour",
     "1D": "1day",
+}
+
+TF_HOURS: Dict[str, float] = {
+    "1H": 1.0,
+    "2H": 2.0,
+    "4H": 4.0,
+    "1D": 24.0,
 }
 
 TV_INTERVAL_MAP: Dict[str, str] = {
@@ -23,7 +32,7 @@ TV_INTERVAL_MAP: Dict[str, str] = {
     "1D": "1D",
 }
 
-DEFAULT_SYMBOLS: List[str] = [
+INITIAL_10_COINS: List[str] = [
     "BTC-USDT",
     "ETH-USDT",
     "SOL-USDT",
@@ -36,6 +45,21 @@ DEFAULT_SYMBOLS: List[str] = [
     "DOT-USDT",
 ]
 
+EXTRA_10_COINS: List[str] = [
+    "TAO-USDT",
+    "ARB-USDT",
+    "SUI-USDT",
+    "APT-USDT",
+    "NEAR-USDT",
+    "SEI-USDT",
+    "HYPE-USDT",
+    "FET-USDT",
+    "ONDO-USDT",
+    "INJ-USDT",
+]
+
+DEFAULT_20_SYMBOLS: List[str] = INITIAL_10_COINS + EXTRA_10_COINS
+
 COINGECKO_ID_MAP: Dict[str, str] = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
@@ -47,7 +71,26 @@ COINGECKO_ID_MAP: Dict[str, str] = {
     "LINK": "chainlink",
     "AVAX": "avalanche-2",
     "DOT": "polkadot",
+    "TAO": "bittensor",
+    "ARB": "arbitrum",
+    "SUI": "sui",
+    "APT": "aptos",
+    "NEAR": "near",
+    "SEI": "sei-network",
+    "HYPE": "hyperliquid",
+    "FET": "fetch-ai",
+    "ONDO": "ondo-finance",
+    "INJ": "injective-protocol",
 }
+
+
+def now_pkt() -> datetime:
+    return datetime.now(PKT_TZ)
+
+
+def format_eta_pkt(hours_ahead: float) -> str:
+    target = now_pkt() + timedelta(hours=max(hours_ahead, 0.25))
+    return f"~{hours_ahead:.1f}h ({target.strftime('%a %H:%M PKT')})"
 
 
 def clean_coin_name(symbol: str) -> str:
@@ -68,36 +111,35 @@ def to_kucoin_symbol(symbol: str) -> str:
     return f"{s}-USDT"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=45, show_spinner=False)
 def fetch_kucoin_klines(symbol: str, tf_label: str, limit: int = 250) -> pd.DataFrame:
     kc_symbol = to_kucoin_symbol(symbol)
     kc_type = TIMEFRAME_OPTIONS.get(tf_label, "1hour")
-    params = {"symbol": kc_symbol, "type": kc_type}
-    resp = requests.get(f"{KUCOIN_BASE_URL}/api/v1/market/candles", params=params, timeout=10)
+    resp = requests.get(
+        f"{KUCOIN_BASE_URL}/api/v1/market/candles",
+        params={"symbol": kc_symbol, "type": kc_type},
+        timeout=10,
+    )
     resp.raise_for_status()
-    payload = resp.json()
-    raw = payload.get("data", [])
+    raw = resp.json().get("data", [])
     if not raw:
         return pd.DataFrame(columns=["timestamp", "open", "close", "high", "low", "volume"])
 
-    # KuCoin returns newest-first: [time, open, close, high, low, volume, turnover]
-    rows = []
-    for item in raw[:limit]:
-        rows.append(
-            {
-                "timestamp": pd.to_datetime(int(item[0]), unit="s", utc=True),
-                "open": float(item[1]),
-                "close": float(item[2]),
-                "high": float(item[3]),
-                "low": float(item[4]),
-                "volume": float(item[5]),
-            }
-        )
-    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
-    return df
+    rows = [
+        {
+            "timestamp": pd.to_datetime(int(item[0]), unit="s", utc=True),
+            "open": float(item[1]),
+            "close": float(item[2]),
+            "high": float(item[3]),
+            "low": float(item[4]),
+            "volume": float(item[5]),
+        }
+        for item in raw[:limit]
+    ]
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_kucoin_last_price(symbol: str) -> Optional[float]:
     kc_symbol = to_kucoin_symbol(symbol)
     resp = requests.get(
@@ -134,7 +176,9 @@ def fetch_web_reference_prices(coins: Tuple[str, ...]) -> Dict[str, Optional[flo
     return result
 
 
-def compute_price_correlation(kucoin_price: Optional[float], web_price: Optional[float]) -> Dict[str, Optional[float]]:
+def compute_price_correlation(
+    kucoin_price: Optional[float], web_price: Optional[float]
+) -> Dict[str, Optional[float]]:
     if kucoin_price is None or kucoin_price == 0:
         return {"kucoin": kucoin_price, "web": web_price, "diff_abs": None, "diff_pct": None, "ratio": None}
     if web_price is None or web_price == 0:
@@ -152,14 +196,11 @@ def compute_price_correlation(kucoin_price: Optional[float], web_price: Optional
 
 
 def fetch_liquidation_snapshot(coin: str) -> Dict[str, str]:
-    """
-    Hook for free liquidation feeds (to be wired in a later step).
-    Returns a clean placeholder status so the UI is ready now.
-    """
+    """Free liquidation feed placeholder (ready for live free API integration)."""
     return {
         "coin": coin,
-        "liq_bias": "Pending Feed",
-        "key_liq_zone": "N/A (Hook Ready)",
+        "liq_bias": "Pending Free Feed",
+        "key_liq_zone": "N/A",
     }
 
 
@@ -174,7 +215,9 @@ def compute_rsi(series: pd.Series, length: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
-def compute_stoch_rsi(rsi: pd.Series, stoch_len: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Tuple[pd.Series, pd.Series]:
+def compute_stoch_rsi(
+    rsi: pd.Series, stoch_len: int = 14, smooth_k: int = 3, smooth_d: int = 3
+) -> Tuple[pd.Series, pd.Series]:
     min_rsi = rsi.rolling(stoch_len, min_periods=1).min()
     max_rsi = rsi.rolling(stoch_len, min_periods=1).max()
     denom = (max_rsi - min_rsi).replace(0.0, np.nan)
