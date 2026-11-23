@@ -16,13 +16,16 @@ def load_logbook() -> List[Dict[str, Any]]:
         return []
     try:
         data = json.loads(LOGBOOK_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
     except Exception:
         return []
 
 
 def save_logbook(records: List[Dict[str, Any]]) -> None:
-    LOGBOOK_PATH.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    clean_records = [item for item in records if isinstance(item, dict)]
+    LOGBOOK_PATH.write_text(json.dumps(clean_records, indent=2), encoding="utf-8")
 
 
 def _normalize_status(res: Any) -> str:
@@ -37,7 +40,8 @@ def _normalize_status(res: Any) -> str:
     return "IDLE"
 
 
-def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[Any]) -> List[Dict[str, Any]]:
+def record_generated_signals(records: List[Any], scan_results: List[Any]) -> List[Dict[str, Any]]:
+    valid_records: List[Dict[str, Any]] = [r for r in records if isinstance(r, dict)]
     existing_keys = {
         (
             r.get("coin"),
@@ -46,7 +50,7 @@ def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[A
             r.get("status_label"),
             round(float(r.get("entry_d") or 0.0), 6),
         )
-        for r in records
+        for r in valid_records
     }
     added = False
     ts_str = now_pkt().strftime("%Y-%m-%d %H:%M:%S PKT")
@@ -64,7 +68,7 @@ def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[A
 
         if key not in existing_keys:
             existing_keys.add(key)
-            records.insert(
+            valid_records.insert(
                 0,
                 {
                     "timestamp_pkt": ts_str,
@@ -86,11 +90,11 @@ def record_generated_signals(records: List[Dict[str, Any]], scan_results: List[A
             added = True
 
     if added:
-        save_logbook(records)
-    return records
+        save_logbook(valid_records)
+    return valid_records
 
 
-def filter_logbook_by_horizon(records: List[Dict[str, Any]], horizon: str) -> pd.DataFrame:
+def filter_logbook_by_horizon(records: List[Any], horizon: str) -> pd.DataFrame:
     cols = [
         "Time (PKT)",
         "Coin",
@@ -106,12 +110,15 @@ def filter_logbook_by_horizon(records: List[Dict[str, Any]], horizon: str) -> pd
         "TP3",
         "Outcome",
     ]
-    if not records:
+    valid_records = [r for r in records if isinstance(r, dict)]
+    if not valid_records:
         return pd.DataFrame(columns=cols)
 
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(valid_records)
     df["parsed_dt"] = pd.to_datetime(
-        df["timestamp_pkt"].astype(str).str.replace(" PKT", "", regex=False),
+        df.get("timestamp_pkt", pd.Series(dtype=str))
+        .astype(str)
+        .str.replace(" PKT", "", regex=False),
         errors="coerce",
     )
     cutoff = now_pkt().replace(tzinfo=None) - {
