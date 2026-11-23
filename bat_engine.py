@@ -13,8 +13,10 @@ class BatScanResult:
     symbol: str
     coin: str
     timeframe: str
-    state: int  # 0: idle, 1: READY TO BE, 2: CONFIRMED, 3: invalidated
+    state: int  # 0: Hunting Waves, 1: READY TO BE, 2: CONFIRMED (ACTIVE), 3: INVALID
     status_label: str  # "READY TO BE" | "CONFIRMED" | "IDLE"
+    status_desc: str  # Exact Pine-style status description
+    error_msg: str
     sig_code: str
     pattern_type: str  # "BULLISH" | "BEARISH" | ""
     overstretched: bool
@@ -27,8 +29,8 @@ class BatScanResult:
     entry_d: Optional[float] = None
     optimal_zone_low: Optional[float] = None
     optimal_zone_high: Optional[float] = None
-    sl: Optional[float] = None  # Strict Pine ATR stop-loss
-    secondary_sl: Optional[float] = None  # Suggested trailing / move-in-profit SL
+    sl: Optional[float] = None  # Exact Pine ATR stop-loss: (A ± 1.113*XA) ± (ATR * atrMult)
+    secondary_sl: Optional[float] = None
     bias_change_level: Optional[float] = None
     tp1: Optional[float] = None
     tp2: Optional[float] = None
@@ -48,23 +50,27 @@ class BatScanResult:
     leg_statuses: Dict[str, str] = field(default_factory=dict)
 
 
-def _pivot_highs(high: np.ndarray, left: int, right: int) -> List[int]:
+def _pine_pivothigh(high: np.ndarray, left: int, right: int) -> List[int]:
+    """Matches Pine's ta.pivothigh(high, pivotLeft, pivotRight) bar registration."""
     idxs: List[int] = []
     n = len(high)
     for i in range(left, n - right):
         val = high[i]
-        if np.all(high[i - left : i] < val) and np.all(high[i + 1 : i + right + 1] <= val):
-            idxs.append(i)
+        if np.all(high[i - left : i] <= val) and np.all(high[i + 1 : i + right + 1] <= val):
+            if np.any(high[i - left : i] < val) or np.any(high[i + 1 : i + right + 1] < val):
+                idxs.append(i)
     return idxs
 
 
-def _pivot_lows(low: np.ndarray, left: int, right: int) -> List[int]:
+def _pine_pivotlow(low: np.ndarray, left: int, right: int) -> List[int]:
+    """Matches Pine's ta.pivotlow(low, pivotLeft, pivotRight) bar registration."""
     idxs: List[int] = []
     n = len(low)
     for i in range(left, n - right):
         val = low[i]
-        if np.all(low[i - left : i] > val) and np.all(low[i + 1 : i + right + 1] >= val):
-            idxs.append(i)
+        if np.all(low[i - left : i] >= val) and np.all(low[i + 1 : i + right + 1] >= val):
+            if np.any(low[i - left : i] > val) or np.any(low[i + 1 : i + right + 1] > val):
+                idxs.append(i)
     return idxs
 
 
@@ -78,20 +84,14 @@ def compute_dynamic_secondary_sl(
     recent_swing_low: Optional[float],
     recent_swing_high: Optional[float],
 ) -> Optional[float]:
-    """
-    Keeps Pine ATR SL as primary SL, and calculates a secondary SL once price
-    moves in the trade's direction (or uses a structural swing/ATR buffer).
-    """
     if primary_sl is None or entry_d is None or live_price is None:
         return primary_sl
 
     if direction == "BULLISH":
-        in_profit = live_price > entry_d
-        tp1_reached = tp1 is not None and live_price >= tp1
         candidate = primary_sl
-        if tp1_reached:
+        if tp1 is not None and live_price >= tp1:
             candidate = max(candidate, entry_d + (0.15 * max(0.0, (tp1 - entry_d))))
-        elif in_profit:
+        elif live_price > entry_d:
             trail = live_price - (1.25 * atr_val)
             if recent_swing_low is not None and recent_swing_low < live_price:
                 trail = max(trail, recent_swing_low - (0.25 * atr_val))
@@ -99,12 +99,10 @@ def compute_dynamic_secondary_sl(
         return float(candidate)
 
     if direction == "BEARISH":
-        in_profit = live_price < entry_d
-        tp1_reached = tp1 is not None and live_price <= tp1
         candidate = primary_sl
-        if tp1_reached:
+        if tp1 is not None and live_price <= tp1:
             candidate = min(candidate, entry_d - (0.15 * max(0.0, (entry_d - tp1))))
-        elif in_profit:
+        elif live_price < entry_d:
             trail = live_price + (1.25 * atr_val)
             if recent_swing_high is not None and recent_swing_high > live_price:
                 trail = min(trail, recent_swing_high + (0.25 * atr_val))
@@ -128,6 +126,8 @@ def run_bat_engine(
             timeframe=timeframe,
             state=0,
             status_label="IDLE",
+            status_desc="Hunting Waves",
+            error_msg="",
             sig_code="-",
             pattern_type="",
             overstretched=False,
@@ -165,10 +165,8 @@ def run_bat_engine(
     pv_r = params["pivot_right"]
     atr_m = params["atr_mult"]
 
-    piv_h_idx = _pivot_highs(high, pv_l, pv_r)
-    piv_l_idx = _pivot_lows(low, pv_l, pv_r)
-    piv_h_set = set(piv_h_idx)
-    piv_l_set = set(piv_l_idx)
+    piv_h_set = set(_pine_pivothigh(high, pv_l, pv_r))
+    piv_l_set = set(_pine_pivotlow(low, pv_l, pv_r))
 
     high_idx_arr: List[int] = []
     high_prc_arr: List[float] = []
@@ -180,6 +178,7 @@ def run_bat_engine(
 
     internal_state = 0
     pattern_type = ""
+    error_msg = ""
     x_idx = a_idx = b_idx = c_idx = -1
     x_price = a_price = b_price = c_price = d_price = np.nan
     price_sl = price_tp1 = price_tp2 = price_tp3 = b_rsi = np.nan
@@ -210,7 +209,8 @@ def run_bat_engine(
         cur_high = float(high[bar_idx])
         cur_low = float(low[bar_idx])
 
-        if internal_state in (0, 3):
+        # Matches Pine: if internalState == 0 or internalState == 3
+        if internal_state == 0 or internal_state == 3:
             if len(low_prc_arr) >= 2 and len(high_prc_arr) >= 2:
                 px_i, px_p = low_idx_arr[1], low_prc_arr[1]
                 pa_i, pa_p = high_idx_arr[1], high_prc_arr[1]
@@ -224,6 +224,7 @@ def run_bat_engine(
                     if 0.382 <= b_ret <= 0.618 and c_ret >= 0.382 and pc_p < pa_p:
                         internal_state = 1
                         pattern_type = "BULLISH"
+                        error_msg = ""
                         x_idx, x_price = px_i, px_p
                         a_idx, a_price = pa_i, pa_p
                         b_idx, b_price = pb_i, pb_p
@@ -235,6 +236,7 @@ def run_bat_engine(
                         price_sl = (a_price - (1.113 * xa_h)) - (cur_atr * atr_m)
                         price_tp1 = price_tp2 = price_tp3 = np.nan
 
+            # Matches Pine: if internalState == 0 and array.size(high_prc_arr) >= 2 ...
             if internal_state == 0 and len(high_prc_arr) >= 2 and len(low_prc_arr) >= 2:
                 px_i, px_p = high_idx_arr[1], high_prc_arr[1]
                 pa_i, pa_p = low_idx_arr[1], low_prc_arr[1]
@@ -248,6 +250,7 @@ def run_bat_engine(
                     if 0.382 <= b_ret <= 0.618 and c_ret >= 0.382 and pc_p > pa_p:
                         internal_state = 1
                         pattern_type = "BEARISH"
+                        error_msg = ""
                         x_idx, x_price = px_i, px_p
                         a_idx, a_price = pa_i, pa_p
                         b_idx, b_price = pb_i, pb_p
@@ -263,8 +266,10 @@ def run_bat_engine(
             if pattern_type == "BULLISH":
                 if cur_high > a_price:
                     internal_state = 3
+                    error_msg = "C Crossed Point A High"
                 elif cur_low <= price_sl:
                     internal_state = 3
+                    error_msg = "Price Violated Stop Loss"
                 elif cur_low <= d_price:
                     internal_state = 2
                     ad_h = abs(a_price - d_price)
@@ -274,8 +279,10 @@ def run_bat_engine(
             elif pattern_type == "BEARISH":
                 if cur_low < a_price:
                     internal_state = 3
+                    error_msg = "C Crossed Point A Low"
                 elif cur_high >= price_sl:
                     internal_state = 3
+                    error_msg = "Price Violated Stop Loss"
                 elif cur_high >= d_price:
                     internal_state = 2
                     ad_h = abs(d_price - a_price)
@@ -351,17 +358,26 @@ def run_bat_engine(
 
     if internal_state == 1:
         status_label = "READY TO BE"
+        status_desc = "WAIT (Overstretched)" if overstretched else "READY (Execute)"
         base = "W" if overstretched else "R"
         sig_code = f"{base}{conf_score}"
     elif internal_state == 2:
         status_label = "CONFIRMED"
+        status_desc = f"{pattern_type} ACTIVE"
         sig_code = f"C{conf_score}"
+    elif internal_state == 3:
+        status_label = "IDLE"
+        status_desc = f"INVALID: {error_msg}" if error_msg else "INVALID"
+        sig_code = "-"
     else:
         status_label = "IDLE"
+        status_desc = "Hunting Waves"
         sig_code = "-"
 
-    supports = [float(low[i]) for i in piv_l_idx if float(low[i]) < cur_close]
-    resistances = [float(high[i]) for i in piv_h_idx if float(high[i]) > cur_close]
+    piv_h_list = sorted(piv_h_set)
+    piv_l_list = sorted(piv_l_set)
+    supports = [float(low[i]) for i in piv_l_list if float(low[i]) < cur_close]
+    resistances = [float(high[i]) for i in piv_h_list if float(high[i]) > cur_close]
     nearest_support = max(supports) if supports else None
     nearest_resistance = min(resistances) if resistances else None
 
@@ -412,15 +428,10 @@ def run_bat_engine(
             else:
                 optimal_entry_status = "Wait for Optimal Reversal Zone (Above D)"
 
-            if nearest_resistance is not None:
-                if tp1_f is not None and nearest_resistance < tp1_f:
-                    tp_obstacle_note = f"Resistance wall @ {nearest_resistance:.6f} before TP1"
-                    total_score -= 8
-                    score_adjustments.append("-8 (Resistance before TP1)")
-                elif price_tp2 is not None and not np.isnan(price_tp2) and nearest_resistance < float(price_tp2):
-                    tp_obstacle_note = f"Resistance wall @ {nearest_resistance:.6f} before TP2"
-                    total_score -= 4
-                    score_adjustments.append("-4 (Resistance before TP2)")
+            if nearest_resistance is not None and tp1_f is not None and nearest_resistance < tp1_f:
+                tp_obstacle_note = f"Resistance wall @ {nearest_resistance:.6f} before TP1"
+                total_score -= 8
+                score_adjustments.append("-8 (Resistance before TP1)")
 
         elif pattern_type == "BEARISH":
             bias_change_level = float(max(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
@@ -432,15 +443,10 @@ def run_bat_engine(
             else:
                 optimal_entry_status = "Wait for Optimal Reversal Zone (Below D)"
 
-            if nearest_support is not None:
-                if tp1_f is not None and nearest_support > tp1_f:
-                    tp_obstacle_note = f"Support wall @ {nearest_support:.6f} before TP1"
-                    total_score -= 8
-                    score_adjustments.append("-8 (Support before TP1)")
-                elif price_tp2 is not None and not np.isnan(price_tp2) and nearest_support > float(price_tp2):
-                    tp_obstacle_note = f"Support wall @ {nearest_support:.6f} before TP2"
-                    total_score -= 4
-                    score_adjustments.append("-4 (Support before TP2)")
+            if nearest_support is not None and tp1_f is not None and nearest_support > tp1_f:
+                tp_obstacle_note = f"Support wall @ {nearest_support:.6f} before TP1"
+                total_score -= 8
+                score_adjustments.append("-8 (Support before TP1)")
 
         if cur_atr > avg_atr * 1.35:
             total_score -= 6
@@ -455,14 +461,6 @@ def run_bat_engine(
         elif vol_ratio < 0.7:
             total_score -= 5
             score_adjustments.append("-5 (Low Volume)")
-
-        dist_pct = abs(cur_close - d_f) / max(abs(d_f), 1e-9) * 100.0
-        if dist_pct <= 1.2:
-            total_score += 5
-            score_adjustments.append("+5 (Near Optimal Zone)")
-        elif dist_pct > 5.0:
-            total_score -= 6
-            score_adjustments.append("-6 (Far From D)")
 
     total_score = int(max(0, min(100, total_score)))
 
@@ -488,6 +486,8 @@ def run_bat_engine(
         timeframe=timeframe,
         state=internal_state,
         status_label=status_label,
+        status_desc=status_desc,
+        error_msg=error_msg,
         sig_code=sig_code,
         pattern_type=pattern_type,
         overstretched=overstretched,
@@ -539,25 +539,21 @@ def enrich_multi_timeframe_context(results: List[BatScanResult]) -> List[BatScan
         for htf in higher_tfs:
             hr = tf_map[htf]
             if hr.status_label == "READY TO BE" and hr.pattern_type == r.pattern_type:
-                notes.append(
-                    f"{htf} {hr.pattern_type} is READY TO BE — price may travel toward {htf} reversal zone before turning."
-                )
+                notes.append(f"{htf} {hr.pattern_type} READY TO BE (D: {hr.entry_d})")
                 if r.status_label == "CONFIRMED":
                     adj += 5
                     r.score_adjustments.append(f"+5 ({htf} Same-Dir Forming)")
             elif hr.status_label == "READY TO BE" and hr.pattern_type != r.pattern_type and hr.pattern_type:
-                notes.append(
-                    f"{htf} {hr.pattern_type} is READY TO BE — current {r.pattern_type} move/TPs may build {htf} setup; wait for optimal zone."
-                )
+                notes.append(f"{htf} {hr.pattern_type} READY TO BE (D: {hr.entry_d})")
                 adj -= 7
                 r.score_adjustments.append(f"-7 ({htf} Opposing Forming)")
             elif hr.status_label == "CONFIRMED" and hr.pattern_type == r.pattern_type:
-                notes.append(f"{htf} {hr.pattern_type} is CONFIRMED — aligned with higher timeframe.")
+                notes.append(f"{htf} {hr.pattern_type} CONFIRMED")
                 adj += 6
                 r.score_adjustments.append(f"+6 ({htf} Confirmed Alignment)")
 
         if not notes:
-            notes.append("No conflicting higher-timeframe forming pattern; wait for optimal reversal zone.")
+            notes.append("No conflicting higher-timeframe forming pattern")
 
         r.mtf_notes = notes
         r.total_score = int(max(0, min(100, adj)))
