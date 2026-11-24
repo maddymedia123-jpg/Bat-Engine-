@@ -26,6 +26,10 @@ class BatScanResult:
     score_adjustments: List[str] = field(default_factory=list)
     bad_confluences: List[str] = field(default_factory=list)
     mtf_notes: List[str] = field(default_factory=list)
+    rsi_val: float = 50.0
+    stoch_k_val: float = 50.0
+    stoch_d_val: float = 50.0
+    momentum_note: str = ""
     entry_d: Optional[float] = None
     optimal_zone_low: Optional[float] = None
     optimal_zone_high: Optional[float] = None
@@ -163,6 +167,7 @@ def run_bat_engine(
     pv_l = params["pivot_left"]
     pv_r = params["pivot_right"]
     atr_m = params["atr_mult"]
+    max_stale_pct = float(params.get("max_signal_dist_pct", 18.0))
 
     piv_h_set = set(_pine_pivothigh(high, pv_l, pv_r))
     piv_l_set = set(_pine_pivotlow(low, pv_l, pv_r))
@@ -305,12 +310,21 @@ def run_bat_engine(
 
     last_i = len(df) - 1
     cur_close = float(close[last_i])
-    cur_rsi = float(rsi[last_i])
-    cur_k = float(stoch_k[last_i])
-    cur_d = float(stoch_d[last_i])
+    cur_rsi = round(float(rsi[last_i]), 2)
+    cur_k = round(float(stoch_k[last_i]), 2)
+    cur_d = round(float(stoch_d[last_i]), 2)
     cur_ema = float(ema_trend[last_i])
     cur_atr = float(atr[last_i])
     avg_atr = float(np.nanmean(atr[max(0, last_i - 30) : last_i + 1])) or cur_atr
+
+    # Filter out stale/far-away historical signals so panels show live/relevant setups
+    if internal_state in (1, 2) and not np.isnan(d_price) and cur_close > 0:
+        dist_pct = abs(cur_close - float(d_price)) / cur_close * 100.0
+        bars_since_c = (last_i - c_idx) if c_idx >= 0 else 0
+        if dist_pct > max_stale_pct or bars_since_c > 60:
+            internal_state = 0
+            pattern_type = ""
+            d_price = price_sl = price_tp1 = price_tp2 = price_tp3 = np.nan
 
     vol_recent = float(np.nanmean(volume[max(0, last_i - 5) : last_i + 1]))
     vol_base = float(np.nanmean(volume[max(0, last_i - 30) : last_i + 1])) or 1.0
@@ -325,30 +339,34 @@ def run_bat_engine(
 
     conf_score = 0
     bad_confluences: List[str] = []
+    momentum_note = f"Live RSI: {cur_rsi:.1f} | Stoch K/D: {cur_k:.1f}/{cur_d:.1f}"
+
     if internal_state in (1, 2):
         rsi_div = False
         stoch_ok = False
         trend_ok = False
         if pattern_type == "BULLISH":
             rsi_div = (not np.isnan(b_rsi)) and (d_price <= b_price) and (cur_rsi > b_rsi)
-            stoch_ok = (cur_k < 30.0) and (cur_k > cur_d)
+            stoch_ok = (cur_k < 45.0) and (cur_k >= cur_d - 3.0)
             trend_ok = cur_close > cur_ema
+            momentum_note = f"Live RSI {cur_rsi:.1f} · Stoch K/D {cur_k:.1f}/{cur_d:.1f} ({'Bullish cross/zone' if stoch_ok else 'Mid/cooling'})"
             if not rsi_div:
-                bad_confluences.append("RSI Div Weak/Broken")
+                bad_confluences.append(f"RSI {cur_rsi:.1f} (no fresh bullish div)")
             if not stoch_ok:
-                bad_confluences.append("Stoch RSI Not Bullish")
+                bad_confluences.append(f"Stoch K/D {cur_k:.1f}/{cur_d:.1f}")
             if not trend_ok:
-                bad_confluences.append("Below Trend EMA")
+                bad_confluences.append("Price below Trend EMA")
         elif pattern_type == "BEARISH":
             rsi_div = (not np.isnan(b_rsi)) and (d_price >= b_price) and (cur_rsi < b_rsi)
-            stoch_ok = (cur_k > 70.0) and (cur_k < cur_d)
+            stoch_ok = (cur_k > 55.0) and (cur_k <= cur_d + 3.0)
             trend_ok = cur_close < cur_ema
+            momentum_note = f"Live RSI {cur_rsi:.1f} · Stoch K/D {cur_k:.1f}/{cur_d:.1f} ({'Bearish cross/zone' if stoch_ok else 'Mid/rebounding'})"
             if not rsi_div:
-                bad_confluences.append("RSI Div Weak/Broken")
+                bad_confluences.append(f"RSI {cur_rsi:.1f} (no fresh bearish div)")
             if not stoch_ok:
-                bad_confluences.append("Stoch RSI Not Bearish")
+                bad_confluences.append(f"Stoch K/D {cur_k:.1f}/{cur_d:.1f}")
             if not trend_ok:
-                bad_confluences.append("Above Trend EMA")
+                bad_confluences.append("Price above Trend EMA")
         conf_score = int(rsi_div) + int(stoch_ok) + int(trend_ok)
 
     conf_pct = round((conf_score / 3.0) * 100.0, 1)
@@ -498,6 +516,10 @@ def run_bat_engine(
         total_score=total_score,
         score_adjustments=score_adjustments,
         bad_confluences=bad_confluences,
+        rsi_val=cur_rsi,
+        stoch_k_val=cur_k,
+        stoch_d_val=cur_d,
+        momentum_note=momentum_note,
         entry_d=None if np.isnan(d_price) else float(d_price),
         optimal_zone_low=optimal_zone_low,
         optimal_zone_high=optimal_zone_high,
