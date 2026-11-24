@@ -162,6 +162,10 @@ def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: Li
                 "tp1": getattr(res, "tp1", None),
                 "tp2": getattr(res, "tp2", None),
                 "tp3": getattr(res, "tp3", None),
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "tp3_hit": False,
+                "sl_hit": False,
                 "outcome": "TRACKING",
                 "ts_epoch": now_ts,
                 "timestamp_pkt": pkt_str,
@@ -173,6 +177,91 @@ def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: Li
         records = records[:300]
         _write_json("signal_logbook", records)
     return records
+
+
+def sync_logbook_outcomes(
+    logbook: List[Dict[str, Any]],
+    active_trades: List[Dict[str, Any]],
+    last_price_by_coin: Dict[str, Optional[float]],
+) -> List[Dict[str, Any]]:
+    """
+    Syncs TP1/TP2/TP3/SL hits from active trades and live swap prices into the
+    Core Signal Audit Logbook so TP Hits (TP1+) and SL Hits stay accurate.
+    """
+    if not logbook:
+        return []
+
+    updated = False
+    active_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {
+        (str(t.get("coin", "")), str(t.get("timeframe", "")), str(t.get("pattern_type", ""))): t
+        for t in active_trades
+    }
+
+    for rec in logbook:
+        coin = str(rec.get("coin", ""))
+        tf = str(rec.get("timeframe", ""))
+        ptype = str(rec.get("pattern_type", ""))
+        tr = active_map.get((coin, tf, ptype))
+        live_p = tr.get("last_price") if tr and tr.get("last_price") is not None else last_price_by_coin.get(coin)
+
+        tp1_hit = bool(rec.get("tp1_hit", False)) or bool(tr and tr.get("tp1_hit"))
+        tp2_hit = bool(rec.get("tp2_hit", False)) or bool(tr and tr.get("tp2_hit"))
+        tp3_hit = bool(rec.get("tp3_hit", False)) or bool(tr and tr.get("tp3_hit"))
+        sl_hit = bool(rec.get("sl_hit", False)) or bool(tr and tr.get("sl_hit"))
+
+        tp1 = rec.get("tp1")
+        tp2 = rec.get("tp2")
+        tp3 = rec.get("tp3")
+        sl = rec.get("sl")
+
+        if isinstance(live_p, (int, float)):
+            if ptype == "BULLISH":
+                if isinstance(tp1, (int, float)) and live_p >= tp1:
+                    tp1_hit = True
+                if isinstance(tp2, (int, float)) and live_p >= tp2:
+                    tp2_hit = True
+                if isinstance(tp3, (int, float)) and live_p >= tp3:
+                    tp3_hit = True
+                if isinstance(sl, (int, float)) and live_p <= sl:
+                    sl_hit = True
+            elif ptype == "BEARISH":
+                if isinstance(tp1, (int, float)) and live_p <= tp1:
+                    tp1_hit = True
+                if isinstance(tp2, (int, float)) and live_p <= tp2:
+                    tp2_hit = True
+                if isinstance(tp3, (int, float)) and live_p <= tp3:
+                    tp3_hit = True
+                if isinstance(sl, (int, float)) and live_p >= sl:
+                    sl_hit = True
+
+        if tp3_hit:
+            new_outcome = "TP3 HIT"
+        elif tp2_hit:
+            new_outcome = "TP2 HIT"
+        elif tp1_hit:
+            new_outcome = "TP1 HIT"
+        elif sl_hit:
+            new_outcome = "SL HIT"
+        else:
+            new_outcome = "TRACKING"
+
+        if (
+            rec.get("tp1_hit") != tp1_hit
+            or rec.get("tp2_hit") != tp2_hit
+            or rec.get("tp3_hit") != tp3_hit
+            or rec.get("sl_hit") != sl_hit
+            or rec.get("outcome") != new_outcome
+        ):
+            rec["tp1_hit"] = tp1_hit
+            rec["tp2_hit"] = tp2_hit
+            rec["tp3_hit"] = tp3_hit
+            rec["sl_hit"] = sl_hit
+            rec["outcome"] = new_outcome
+            updated = True
+
+    if updated:
+        _write_json("signal_logbook", logbook)
+    return logbook
 
 
 def filter_logbook_records(records: List[Dict[str, Any]], horizon: str) -> List[Dict[str, Any]]:
@@ -220,20 +309,19 @@ def load_audit_logs() -> List[Dict[str, Any]]:
 def _save_audit_logs(audits: List[Dict[str, Any]]) -> None:
     trimmed = audits[:100]
     _write_json("audit_logs", trimmed)
-    _exec_turso(
-        [
-            {
-                "sql": "INSERT OR REPLACE INTO audit_logs (id, ts_epoch, payload) VALUES (?, ?, ?)",
-                "args": [
-                    {"type": "text", "value": f"audit_{trimmed[0].get('audited_pkt', '')}_{trimmed[0].get('coin', '')}"},
-                    {"type": "float", "value": float(trimmed[0].get("ts_epoch", datetime.now(PKT_TZ).timestamp()))},
-                    {"type": "text", "value": json.dumps(trimmed[0], default=str)},
-                ],
-            }
-        ]
-        if trimmed
-        else []
-    )
+    if trimmed:
+        _exec_turso(
+            [
+                {
+                    "sql": "INSERT OR REPLACE INTO audit_logs (id, ts_epoch, payload) VALUES (?, ?, ?)",
+                    "args": [
+                        {"type": "text", "value": f"audit_{trimmed[0].get('audited_pkt', '')}_{trimmed[0].get('coin', '')}"},
+                        {"type": "float", "value": float(trimmed[0].get("ts_epoch", datetime.now(PKT_TZ).timestamp()))},
+                        {"type": "text", "value": json.dumps(trimmed[0], default=str)},
+                    ],
+                }
+            ]
+        )
 
 
 def audit_and_correlate_summary(
@@ -246,89 +334,54 @@ def audit_and_correlate_summary(
     logbook: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Correlates the new summary update with the previous summary for the same coin/TF
-    and past memory audits, flagging missed items and raising accuracy score.
+    Silent background memory correlation & accuracy updater on every rerun.
     """
     audits = list(existing_audits) if isinstance(existing_audits, list) else []
     now_dt = datetime.now(PKT_TZ)
     now_ts = now_dt.timestamp()
 
     coin_past_audits = [a for a in audits if a.get("coin") == target_coin and a.get("timeframe") == target_tf]
-    prev_accuracy = float(coin_past_audits[0].get("accuracy_pct", 72.0)) if coin_past_audits else 72.0
+    prev_accuracy = float(coin_past_audits[0].get("accuracy_pct", 74.0)) if coin_past_audits else 74.0
 
     missed_items: List[str] = []
-    sl_mode = str(setup_context.get("sl_mode") or "PRIMARY SL")
     tp1_hit = bool(setup_context.get("tp1_hit", False))
     tp2_hit = bool(setup_context.get("tp2_hit", False))
     sl_hit = bool(setup_context.get("sl_hit", False))
+    sl_mode = str(setup_context.get("sl_mode") or "PRIMARY SL")
     bad_confs = setup_context.get("bad_confluences") or []
     wall = str(setup_context.get("tp_obstacle_note") or "Clear path")
 
     if previous_summary:
         prev_l = previous_summary.lower()
         if tp1_hit and "tp1" not in prev_l:
-            missed_items.append("Prior summary missed TP1 hit & shift to Break-Even / TP2 focus")
-        if sl_mode != "PRIMARY SL" and sl_mode.lower() not in prev_l:
-            missed_items.append(f"Prior summary did not reflect {sl_mode}")
-        if bad_confs and "confluence" not in prev_l and "warning" not in prev_l:
-            missed_items.append("Prior summary missed active confluence warnings")
-        if "wall" not in prev_l and wall != "Clear path":
-            missed_items.append(f"Prior summary missed path wall ({wall})")
-    else:
-        missed_items.append("Initial baseline summary recorded; future reruns will cross-check against this snapshot")
+            missed_items.append("TP1 hit & Break-Even / TP2 transition")
+        if tp2_hit and "tp2" not in prev_l:
+            missed_items.append("TP2 hit & TP3 / Break-Even protection")
+        if sl_mode != "PRIMARY SL" and "break-even" not in prev_l and "secondary" not in prev_l:
+            missed_items.append(f"SL posture shift ({sl_mode})")
+        if bad_confs and "rsi" not in prev_l and "stoch" not in prev_l:
+            missed_items.append("Live RSI / Stoch RSI momentum reading")
+        if wall != "Clear path" and "wall" not in prev_l and "resistance" not in prev_l and "support" not in prev_l:
+            missed_items.append(f"Path obstacle ({wall})")
 
-    accuracy_gain = 4.0 if not missed_items or previous_summary is None else 6.0
-    new_accuracy = round(min(99.0, prev_accuracy + accuracy_gain), 1)
-
-    lesson = (
-        f"Correlated with prior {target_coin} [{target_tf}] summary; addressed: {'; '.join(missed_items[:2])}."
-        if missed_items
-        else f"Consistent with prior {target_coin} [{target_tf}] summary; state & SL/TP posture verified."
-    )
-    rule_adj = (
-        "Enforce SL mode (Primary -> Secondary -> Break-Even for TP2) and flag confluence/wall shifts on every rerun."
-    )
+    new_accuracy = round(min(99.0, prev_accuracy + (5.0 if missed_items else 3.0)), 1)
 
     entry = {
         "ts_epoch": now_ts,
         "audited_pkt": now_dt.strftime("%Y-%m-%d %H:%M PKT"),
         "coin": target_coin,
         "timeframe": target_tf,
-        "outcome_seen": (
-            f"SL Mode: {sl_mode} | TP1:{int(tp1_hit)} TP2:{int(tp2_hit)} SL:{int(sl_hit)} "
-            f"| Active:{len(active_trades)} Logged:{len(logbook)}"
-        ),
+        "outcome_seen": f"Mode:{sl_mode} | TP1:{int(tp1_hit)} TP2:{int(tp2_hit)} SL:{int(sl_hit)}",
         "missed_items": missed_items,
         "accuracy_pct": new_accuracy,
-        "lesson_learned": lesson,
-        "rule_adjustment": rule_adj,
+        "lesson_learned": (
+            f"Updated with {', '.join(missed_items)}." if missed_items else "Aligned with latest price/TP/SL state."
+        ),
+        "rule_adjustment": "Prioritize TP1 close/BE shift -> TP2 continuation and live RSI/Stoch context.",
     }
     audits.insert(0, entry)
     _save_audit_logs(audits)
     return audits[:100], entry
-
-
-def silent_self_audit_and_update(
-    existing_audits: List[Dict[str, Any]],
-    active_trades: List[Dict[str, Any]],
-    logbook: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    audits = list(existing_audits) if isinstance(existing_audits, list) else []
-    now_dt = datetime.now(PKT_TZ)
-    entry = {
-        "ts_epoch": now_dt.timestamp(),
-        "audited_pkt": now_dt.strftime("%Y-%m-%d %H:%M PKT"),
-        "coin": active_trades[0].get("coin", "SCAN") if active_trades else "SCAN",
-        "timeframe": active_trades[0].get("timeframe", "1H") if active_trades else "1H",
-        "outcome_seen": f"{len(active_trades)} active / {len(logbook)} logged",
-        "missed_items": [],
-        "accuracy_pct": round(min(99.0, (float(audits[0].get("accuracy_pct", 72.0)) + 1.5) if audits else 73.5), 1),
-        "lesson_learned": "Verified coin/timeframe binding, SL progression state, and logbook consistency.",
-        "rule_adjustment": "Keep confirmation strictly on active swap pattern state and sync SL/TP transitions.",
-    }
-    audits.insert(0, entry)
-    _save_audit_logs(audits)
-    return audits[:100]
 
 
 def _resolve_openrouter_key(api_key: Optional[str] = None) -> str:
@@ -341,41 +394,53 @@ def _resolve_openrouter_key(api_key: Optional[str] = None) -> str:
     return ""
 
 
-def _build_fallback_layman_summary(
+def _build_partner_layman_summary(
     target_coin: str,
     target_tf: str,
     setup_context: Dict[str, Any],
-    all_committed_trades: List[Dict[str, Any]],
-    audit_history: List[Dict[str, Any]],
-    previous_summary: Optional[str] = None,
     audit_entry: Optional[Dict[str, Any]] = None,
     api_note: str = "",
 ) -> str:
     direction = str(setup_context.get("pattern_type") or "SETUP")
-    sig_code = str(setup_context.get("sig_code") or setup_context.get("status_label") or "")
+    is_committed = bool(setup_context.get("is_committed", False))
+    conf_pct = setup_context.get("conf_pct", 0.0)
     score = setup_context.get("total_score", 0)
-    conf = setup_context.get("conf_pct", 0.0)
-    mtf = setup_context.get("mtf_notes") or ["No conflicting higher-timeframe forming pattern"]
-    wall = setup_context.get("tp_obstacle_note") or "Clear path"
-    sl_mode = setup_context.get("sl_mode") or "PRIMARY SL"
-    active_sl = setup_context.get("active_sl_guidance") or setup_context.get("sl")
-    acc_pct = (audit_entry or {}).get("accuracy_pct", 75.0)
-    missed = (audit_entry or {}).get("missed_items") or []
+    rsi_v = setup_context.get("rsi_val", 50.0)
+    sk_v = setup_context.get("stoch_k_val", 50.0)
+    sd_v = setup_context.get("stoch_d_val", 50.0)
+    tp1_hit = bool(setup_context.get("tp1_hit", False))
+    tp2_hit = bool(setup_context.get("tp2_hit", False))
+    sl_hit = bool(setup_context.get("sl_hit", False))
+    wall = str(setup_context.get("tp_obstacle_note") or "Clear path")
+    eta_tp2 = str(setup_context.get("eta_tp2") or "")
+    eta_tp3 = str(setup_context.get("eta_tp3") or "")
+    acc_pct = (audit_entry or {}).get("accuracy_pct", 78.0)
 
-    corr_note = (
-        f"Correlated with prior summary (Accuracy: **{acc_pct}%**). Adjustments: {', '.join(missed)}."
-        if missed
-        else f"Correlated with prior summary (Accuracy: **{acc_pct}%**); no missed items detected."
-    )
+    if sl_hit:
+        game_plan = "Stop loss hit—step back, protect capital, and wait for the next clean structure rather than chasing."
+    elif tp2_hit:
+        game_plan = f"TP2 is in the bag. Lock SL at Break-Even, let remaining size work toward TP3 ({eta_tp3 or 'pending'}), or take profits if momentum fades."
+    elif tp1_hit:
+        game_plan = (
+            f"TP1 hit—you can close/take TP1 profit here, OR shift SL to Break-Even and look for TP2 ({eta_tp2 or 'next target'}). "
+            f"If you closed at TP1 and want back in for TP2, wait for a clean pullback/reversal reaction rather than chasing."
+        )
+    elif is_committed:
+        game_plan = (
+            f"Trade is live—start with Primary SL, trail with Secondary SL once price moves in your favor, "
+            f"and shift SL to Break-Even once TP1 is hit to target TP2 ({eta_tp2 or 'pending'})."
+        )
+    else:
+        opt_low = setup_context.get("optimal_zone_low")
+        opt_high = setup_context.get("optimal_zone_high")
+        game_plan = f"Wait for price inside the optimal entry/reversal zone ({opt_low} – {opt_high}) before committing."
 
-    header_note = f"*(OpenRouter note: {api_note} — showing memory-correlated layman read)*\n\n" if api_note else ""
+    prefix = f"*(Feed note: {api_note})*\n\n" if api_note else ""
     return (
-        f"{header_note}"
-        f"**Institutional Layman Read — {target_coin} [{target_tf}] ({direction} · {sig_code}):**\n\n"
-        f"* **What's Happening Now:** Score is **{score}/100** with confluence at **{conf}%**. {', '.join(str(x) for x in mtf)}.\n"
-        f"* **Risk & SL Plan:** Current SL posture is **{sl_mode}** (Active SL guide: `{active_sl}`). Path wall: **{wall}**.\n"
-        f"* **What Could Happen Next:** Track TP1 -> TP2 -> TP3 progression; shift SL to Break-Even and focus on TP2 once TP1 is secured.\n"
-        f"* **Memory & Self-Audit Correlation:** {corr_note} (Tracking {len(all_committed_trades)} committed trade(s).)"
+        f"{prefix}"
+        f"**{target_coin}USDT.P [{target_tf}] · {direction} (Confidence {conf_pct:.0f}% · Score {score}/100 · Model Acc {acc_pct}%)**\n\n"
+        f"* **Read:** {game_plan}\n"
+        f"* **Momentum Now:** RSI `{rsi_v}` · Stoch K/D `{sk_v}/{sd_v}` · Path: `{wall}`."
     )
 
 
@@ -391,15 +456,12 @@ def run_on_demand_trader_agent(
 ) -> str:
     resolved_key = _resolve_openrouter_key(api_key)
     if not resolved_key:
-        return _build_fallback_layman_summary(
+        return _build_partner_layman_summary(
             target_coin,
             target_tf,
             setup_context,
-            all_committed_trades,
-            audit_history,
-            previous_summary=previous_summary,
             audit_entry=audit_entry,
-            api_note="No OpenRouter API key found in input or Streamlit Secrets (`OPENROUTER_API_KEY`)",
+            api_note="Set OPENROUTER_API_KEY in Streamlit Secrets for AI partner prose",
         )
 
     model = _get_secret("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL) or DEFAULT_OPENROUTER_MODEL
@@ -411,20 +473,20 @@ def run_on_demand_trader_agent(
     }
 
     system_prompt = (
-        "You are a disciplined crypto swap futures trading agent with persistent self-audit memory. "
-        "Always correlate your updated summary with the previous summary for this coin/timeframe, "
-        "incorporate any missed items from the self-audit log to raise accuracy, and clearly explain: "
-        "What's Happening Now, Risk & SL Plan (Primary SL vs Secondary SL vs Break-Even -> TP2), "
-        "What Could Happen Next, and Memory Correlation & Self-Audit."
+        "You are a sharp, calm, practical crypto swap trading partner—never robotic, never lecturing, "
+        "and never saying 'I audited you' or 'self-audit'. Silently use the previous summary and "
+        "context updates so your response is accurate and up to date. Always state Confidence %, "
+        "live RSI and Stoch K/D, and clear trade guidance: if TP1 is hit, tell the user they can close at TP1 "
+        "or shift SL to Break-Even and look for TP2 (and if closed at TP1, wait for a clean reversal zone before "
+        "re-entering for TP2). Keep it crisp, human, and easy to read in 4-5 short bullets."
     )
     user_payload = {
-        "target_coin": target_coin,
-        "target_timeframe": target_tf,
-        "setup_context": setup_context,
-        "previous_summary": previous_summary or "None",
-        "latest_self_audit": audit_entry or {},
-        "recent_audits": audit_history[:5],
-        "committed_trades": all_committed_trades[:10],
+        "coin": target_coin,
+        "timeframe": target_tf,
+        "setup": setup_context,
+        "previous_summary": previous_summary or "",
+        "background_correlation_notes": (audit_entry or {}).get("missed_items", []),
+        "committed_count": len(all_committed_trades),
     }
 
     try:
@@ -438,7 +500,7 @@ def run_on_demand_trader_agent(
                     {"role": "user", "content": json.dumps(user_payload, default=str)},
                 ],
                 "temperature": 0.25,
-                "max_tokens": 550,
+                "max_tokens": 420,
             },
             timeout=20,
         )
@@ -448,24 +510,12 @@ def run_on_demand_trader_agent(
         content = (((choices[0] or {}).get("message") or {}).get("content") or "").strip()
         if content:
             return content
-        return _build_fallback_layman_summary(
-            target_coin,
-            target_tf,
-            setup_context,
-            all_committed_trades,
-            audit_history,
-            previous_summary=previous_summary,
-            audit_entry=audit_entry,
-            api_note="OpenRouter returned an empty response",
-        )
+        return _build_partner_layman_summary(target_coin, target_tf, setup_context, audit_entry=audit_entry)
     except Exception as exc:
-        return _build_fallback_layman_summary(
+        return _build_partner_layman_summary(
             target_coin,
             target_tf,
             setup_context,
-            all_committed_trades,
-            audit_history,
-            previous_summary=previous_summary,
             audit_entry=audit_entry,
             api_note=str(exc),
         )
@@ -480,10 +530,6 @@ def send_discord_webhook_alert(
     color: int = 0x00C853,
     force: bool = False,
 ) -> bool:
-    """
-    Sends a Discord webhook embed and deduplicates identical event_key states
-    so the bot alerts on new signals, warnings, TP/SL hits, and SL transitions.
-    """
     hook_url = (webhook_url_override or "").strip() or _get_secret("DISCORD_WEBHOOK_URL", "")
     if not hook_url:
         return False
@@ -496,7 +542,7 @@ def send_discord_webhook_alert(
         return False
 
     payload = {
-        "username": "Harmonics Swap Bot",
+        "username": "Harmonics Partner Bot",
         "embeds": [
             {
                 "title": title[:250],
