@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -25,6 +28,7 @@ from market_data import (
 )
 from turso_store import (
     HORIZONS,
+    PKT_TZ,
     audit_and_correlate_summary,
     filter_logbook_records,
     init_storage,
@@ -42,6 +46,72 @@ from turso_store import (
 )
 
 st.set_page_config(page_title="Harmonics Engine — Bat Pattern", layout="wide")
+
+GATE_INTERVAL_MAP: Dict[str, str] = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "1H": "1h",
+    "2H": "2h",
+    "4H": "4h",
+    "1D": "1d",
+}
+
+
+def to_gate_contract(coin_or_sym: str) -> str:
+    coin = clean_coin_name(coin_or_sym).upper()
+    return f"{coin}_USDT"
+
+
+@st.cache_data(ttl=20)
+def fetch_gate_last_price(coin_or_sym: str) -> Optional[float]:
+    contract = to_gate_contract(coin_or_sym)
+    try:
+        resp = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/tickers",
+            params={"contract": contract},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            val = data[0].get("last") or data[0].get("mark_price")
+            if val is not None:
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=30)
+def fetch_gate_klines(coin_or_sym: str, tf_label: str, limit: int = 250) -> pd.DataFrame:
+    contract = to_gate_contract(coin_or_sym)
+    interval = GATE_INTERVAL_MAP.get(tf_label, "1h")
+    try:
+        resp = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+            params={"contract": contract, "interval": interval, "limit": min(limit, 500)},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame()
+        recs = []
+        for r in rows:
+            if isinstance(r, dict):
+                recs.append(
+                    {
+                        "open": float(r.get("o", 0.0)),
+                        "high": float(r.get("h", 0.0)),
+                        "low": float(r.get("l", 0.0)),
+                        "close": float(r.get("c", 0.0)),
+                        "volume": float(r.get("v", r.get("sum", 0.0)) or 0.0),
+                    }
+                )
+        return pd.DataFrame(recs)
+    except Exception:
+        return pd.DataFrame()
 
 
 def fmt_price(val: Optional[float]) -> str:
@@ -68,21 +138,22 @@ def evaluate_sl_and_tp_posture(trade: Dict[str, object]) -> Tuple[str, Optional[
     be_sl = trade.get("break_even_sl") or entry_p
     tp1_hit = bool(trade.get("tp1_hit", False))
     tp2_hit = bool(trade.get("tp2_hit", False))
+    tp3_hit = bool(trade.get("tp3_hit", False))
     sl_hit = bool(trade.get("sl_hit", False))
 
     if sl_hit:
-        return "SL HIT", primary_sl if isinstance(primary_sl, (int, float)) else None, "Stop hit—stay out and wait for a fresh structure."
-
+        return "SL HIT", primary_sl if isinstance(primary_sl, (int, float)) else None, "SL hit—trade closing after grace window."
+    if tp1_hit and tp2_hit and tp3_hit:
+        return "TP HIT", None, "All TPs hit—trade closing after grace window."
     if tp2_hit:
         be_val = float(be_sl) if isinstance(be_sl, (int, float)) else (float(entry_p) if isinstance(entry_p, (int, float)) else None)
-        return "BREAK-EVEN SL (TP3 FOCUS)", be_val, "TP2 hit—keep SL at Break-Even and aim for TP3 or lock gains."
-
+        return "BREAK-EVEN SL (TP3 FOCUS)", be_val, "TP2 hit—keep SL at Break-Even and target TP3."
     if tp1_hit:
         be_val = float(be_sl) if isinstance(be_sl, (int, float)) else (float(entry_p) if isinstance(entry_p, (int, float)) else None)
         return (
             "SHIFT SL TO BREAK-EVEN -> LOOK FOR TP2",
             be_val,
-            "TP1 hit—close here if desired, or shift SL to Break-Even and look for TP2 (wait for reversal zone if re-entering).",
+            "TP1 hit—close here or shift SL to Break-Even for TP2.",
         )
 
     fav_move = False
@@ -90,17 +161,9 @@ def evaluate_sl_and_tp_posture(trade: Dict[str, object]) -> Tuple[str, Optional[
         fav_move = (direction == "BULLISH" and live_p > entry_p) or (direction == "BEARISH" and live_p < entry_p)
 
     if fav_move and isinstance(secondary_sl, (int, float)):
-        return (
-            "SECONDARY SL (TRAILING)",
-            float(secondary_sl),
-            "Price moving in favor—switch from Primary SL to Secondary SL.",
-        )
+        return "SECONDARY SL (TRAILING)", float(secondary_sl), "Price in favor—trail with Secondary SL."
 
-    return (
-        "PRIMARY SL",
-        float(primary_sl) if isinstance(primary_sl, (int, float)) else None,
-        "Hold Primary SL until price moves in favor or hits TP1.",
-    )
+    return "PRIMARY SL", float(primary_sl) if isinstance(primary_sl, (int, float)) else None, "Hold Primary SL."
 
 
 def compute_tp_progress(
@@ -309,18 +372,34 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("Exchange Feed (Binance vs Gate.io)")
+    feed_mode = st.selectbox(
+        "Data Source",
+        options=["Auto (Closest to Binance)", "Gate.io Swap", "Binance Swap"],
+        index=0,
+    )
+    post_exit_grace_hrs = st.slider(
+        "Keep closed trade (TP/SL hit) before exit (hrs)",
+        min_value=0.0,
+        max_value=4.0,
+        value=2.0,
+        step=0.5,
+    )
+
+    st.divider()
     st.subheader("Live Scanning (Non-Blocking)")
     auto_refresh = st.checkbox("Auto-update active monitor fragment", value=False)
     refresh_sec = st.slider("Fragment update interval (sec)", min_value=15, max_value=180, value=30, step=5)
 
     st.divider()
-    st.subheader("Discord Bot Webhook")
+    st.subheader("Discord Partner Alerts")
     discord_webhook_url = st.text_input(
         "Discord Webhook URL (or set DISCORD_WEBHOOK_URL in Secrets)",
         type="password",
         placeholder="https://discord.com/api/webhooks/...",
     ).strip()
     discord_enabled = st.checkbox("Enable Discord Bot Alerts", value=True)
+    discord_low_threshold = st.slider("Discord Alert Probability Floor", min_value=25, max_value=80, value=45, step=5)
 
     st.divider()
     st.subheader("AI Agent Key (On-Demand Only)")
@@ -369,13 +448,35 @@ params = {
 }
 
 st.title("Harmonics Engine")
-st.caption("Pine v6 BatPattern engine on swap futures (defaulting to BTCUSDT.P) with live RSI/Stoch, SL progression, logbook TP/SL sync, and Discord partner alerts.")
+st.caption("Pine v6 BatPattern engine on swap futures (Binance & Gate.io proximity check), auto-exit into backtest logbook on TP/SL hit, and master partner AI.")
 
 coins_list = [clean_coin_name(s) for s in symbols_list]
 last_price_by_coin: Dict[str, Optional[float]] = {}
+source_used_by_coin: Dict[str, str] = {}
+gate_diff_pct_by_coin: Dict[str, Optional[float]] = {}
+
 for sym in symbols_list:
     coin = clean_coin_name(sym)
-    last_price_by_coin[coin] = fetch_perp_last_price(sym)
+    b_price = fetch_perp_last_price(sym)
+    g_price = fetch_gate_last_price(coin)
+    diff_pct: Optional[float] = None
+    if isinstance(b_price, (int, float)) and isinstance(g_price, (int, float)) and b_price > 0:
+        diff_pct = abs(g_price - b_price) / b_price * 100.0
+    gate_diff_pct_by_coin[coin] = diff_pct
+
+    if feed_mode == "Gate.io Swap":
+        last_price_by_coin[coin] = g_price if g_price is not None else b_price
+        source_used_by_coin[coin] = "Gate.io" if g_price is not None else "Binance"
+    elif feed_mode == "Binance Swap":
+        last_price_by_coin[coin] = b_price if b_price is not None else g_price
+        source_used_by_coin[coin] = "Binance" if b_price is not None else "Gate.io"
+    else:
+        if g_price is not None and (b_price is None or (diff_pct is not None and diff_pct <= 0.35)):
+            last_price_by_coin[coin] = g_price
+            source_used_by_coin[coin] = "Gate.io (Close)"
+        else:
+            last_price_by_coin[coin] = b_price if b_price is not None else g_price
+            source_used_by_coin[coin] = "Binance"
 
 results: List[BatScanResult] = []
 df_lookup: Dict[tuple, pd.DataFrame] = {}
@@ -384,8 +485,21 @@ for tf in selected_tfs:
     for sym in symbols_list:
         coin = clean_coin_name(sym)
         try:
-            df = fetch_perp_klines(sym, tf, limit=250)
-            if last_price_by_coin.get(coin) is None and not df.empty:
+            b_df = fetch_perp_klines(sym, tf, limit=250)
+            g_df = fetch_gate_klines(coin, tf, limit=250)
+            if feed_mode == "Gate.io Swap":
+                df = g_df if not g_df.empty else b_df
+            elif feed_mode == "Binance Swap":
+                df = b_df if not b_df.empty else g_df
+            else:
+                if not g_df.empty and not b_df.empty:
+                    b_last = float(b_df["close"].iloc[-1])
+                    g_last = float(g_df["close"].iloc[-1])
+                    df = g_df if b_last > 0 and abs(g_last - b_last) / b_last <= 0.35 else b_df
+                else:
+                    df = g_df if not g_df.empty else b_df
+
+            if last_price_by_coin.get(coin) is None and df is not None and not df.empty:
                 last_price_by_coin[coin] = float(df["close"].iloc[-1])
         except Exception as exc:
             st.warning(f"Swap fetch issue for {coin} ({tf}): {exc}")
@@ -411,13 +525,15 @@ for r in results:
 results = deduped_results
 st.session_state.logbook = record_generated_signals(st.session_state.logbook, results)
 result_map: Dict[tuple, BatScanResult] = {(r.coin, r.timeframe): r for r in results}
-committed_keys = {(t.get("coin"), t.get("timeframe")) for t in st.session_state.active_trades}
 
+now_ts = datetime.now(PKT_TZ).timestamp()
 trades_changed = False
+surviving_trades: List[Dict[str, object]] = []
+
 for trade in st.session_state.active_trades:
-    coin = trade["coin"]
-    tf = trade["timeframe"]
-    direction = trade["pattern_type"]
+    coin = str(trade["coin"])
+    tf = str(trade["timeframe"])
+    direction = str(trade["pattern_type"])
     live_price = last_price_by_coin.get(coin)
     if live_price is None:
         live_price = trade.get("last_price")
@@ -429,19 +545,18 @@ for trade in st.session_state.active_trades:
         trade["conf_pct"] = latest_scan.conf_pct
         trade["total_score"] = latest_scan.total_score
         trade["bad_confluences"] = latest_scan.bad_confluences
-        trade["rsi_val"] = latest_scan.rsi_val
-        trade["stoch_k_val"] = latest_scan.stoch_k_val
-        trade["stoch_d_val"] = latest_scan.stoch_d_val
         trade["momentum_note"] = latest_scan.momentum_note
         trade["beyond_optimal_entry"] = latest_scan.beyond_optimal_entry
         trade["optimal_entry_status"] = latest_scan.optimal_entry_status
+        trade["optimal_zone_low"] = latest_scan.optimal_zone_low
+        trade["optimal_zone_high"] = latest_scan.optimal_zone_high
         trade["secondary_sl"] = latest_scan.secondary_sl
         trade["break_even_sl"] = latest_scan.break_even_sl or trade.get("entry_d")
         trade["bias_change_level"] = latest_scan.bias_change_level
         trade["mtf_notes"] = latest_scan.mtf_notes
         trade["tp_obstacle_note"] = latest_scan.tp_obstacle_note
 
-    if live_price is not None and not trade.get("sl_hit", False):
+    if isinstance(live_price, (int, float)) and not trade.get("sl_hit", False):
         if direction == "BULLISH":
             if trade.get("tp1") is not None and live_price >= trade["tp1"] and not trade.get("tp1_hit"):
                 trade["tp1_hit"] = True
@@ -469,12 +584,30 @@ for trade in st.session_state.active_trades:
                 trade["sl_hit"] = True
                 trades_changed = True
 
+    all_tps_hit = bool(trade.get("tp1_hit") and trade.get("tp2_hit") and trade.get("tp3_hit"))
+    sl_hit = bool(trade.get("sl_hit", False))
+    is_finished = all_tps_hit or sl_hit
+
+    if is_finished and not trade.get("closed_ts"):
+        trade["closed_ts"] = now_ts
+        trade["exit_reason"] = "TP HIT" if all_tps_hit else "SL HIT"
+        trades_changed = True
+
     sl_mode, active_sl_val, sl_action_note = evaluate_sl_and_tp_posture(trade)
     trade["sl_mode"] = sl_mode
     trade["active_sl_guidance"] = active_sl_val
     trade["sl_action_note"] = sl_action_note
 
-if trades_changed:
+    if is_finished:
+        elapsed_hrs = (now_ts - float(trade.get("closed_ts", now_ts))) / 3600.0
+        if elapsed_hrs > float(post_exit_grace_hrs):
+            trades_changed = True
+            continue
+
+    surviving_trades.append(trade)
+
+if len(surviving_trades) != len(st.session_state.active_trades) or trades_changed:
+    st.session_state.active_trades = surviving_trades
     save_active_trades(st.session_state.active_trades)
 
 st.session_state.logbook = sync_logbook_outcomes(
@@ -483,10 +616,13 @@ st.session_state.logbook = sync_logbook_outcomes(
     last_price_by_coin,
 )
 
+committed_keys = {(t.get("coin"), t.get("timeframe")) for t in st.session_state.active_trades}
+
 
 def _dispatch_discord_for_trade_state(trade: Dict[str, object], partner_summary: Optional[str] = None) -> None:
     if not discord_enabled:
         return
+    score_val = int(trade.get("total_score", 0) or 0)
     coin = str(trade.get("coin", ""))
     tf = str(trade.get("timeframe", ""))
     direction = str(trade.get("pattern_type", ""))
@@ -498,24 +634,26 @@ def _dispatch_discord_for_trade_state(trade: Dict[str, object], partner_summary:
     tp2_hit = bool(trade.get("tp2_hit", False))
     tp3_hit = bool(trade.get("tp3_hit", False))
     sl_hit = bool(trade.get("sl_hit", False))
-    bad_confs = trade.get("bad_confluences") or []
     wall = str(trade.get("tp_obstacle_note") or "Clear path")
     tf_h = TF_HOURS.get(tf, 1.0)
     eta_tp2 = str(trade.get("eta_tp2") or format_eta_pkt(8.0 * tf_h))
     eta_tp3 = str(trade.get("eta_tp3") or format_eta_pkt(16.0 * tf_h))
 
+    if score_val < int(discord_low_threshold) and not (sl_hit or (tp1_hit and tp2_hit and tp3_hit)):
+        return
+
     fields = [
         {"name": "Entry / Live", "value": f"{fmt_price(entry_p if isinstance(entry_p, (int, float)) else None)} -> {fmt_price(live_p if isinstance(live_p, (int, float)) else None)}", "inline": True},
+        {"name": "Prob Score", "value": f"{score_val}/100 ({trade.get('conf_pct', 0):.0f}% Conf)", "inline": True},
         {"name": "SL Posture", "value": f"{sl_mode} ({fmt_price(active_sl if isinstance(active_sl, (int, float)) else None)})", "inline": True},
-        {"name": "Momentum", "value": str(trade.get("momentum_note") or f"RSI {trade.get('rsi_val', 50)} · Stoch {trade.get('stoch_k_val', 50)}/{trade.get('stoch_d_val', 50)}"), "inline": False},
         {"name": "Targets & ETA", "value": f"TP1 {fmt_price(trade.get('tp1'))} | TP2 {fmt_price(trade.get('tp2'))} ({eta_tp2}) | TP3 {fmt_price(trade.get('tp3'))} ({eta_tp3})", "inline": False},
-        {"name": "Partner Plan", "value": str(trade.get("sl_action_note") or "-"), "inline": False},
+        {"name": "Partner Move", "value": str(trade.get("sl_action_note") or "-"), "inline": False},
     ]
 
     if partner_summary:
         send_discord_webhook_alert(
-            event_key=f"partner_{coin}_{tf}_{sl_mode}_{int(tp1_hit)}{int(tp2_hit)}",
-            title=f"Partner Update — {coin}USDT.P [{tf}] ({direction})",
+            event_key=f"partner_{coin}_{tf}_{sl_mode}_{int(tp1_hit)}{int(tp2_hit)}{int(tp3_hit)}",
+            title=f"Partner Read — {coin}USDT.P [{tf}] ({direction})",
             description=partner_summary[:1800],
             fields=fields,
             webhook_url_override=discord_webhook_url,
@@ -526,17 +664,17 @@ def _dispatch_discord_for_trade_state(trade: Dict[str, object], partner_summary:
     if sl_hit:
         send_discord_webhook_alert(
             event_key=f"sl_hit_{coin}_{tf}",
-            title=f"SL Hit — {coin}USDT.P [{tf}] ({direction})",
-            description=str(trade.get("sl_action_note") or "Stop loss triggered."),
+            title=f"SL HIT — {coin}USDT.P [{tf}] ({direction})",
+            description=f"SL hit. Logged for backtest; closing active slot after {post_exit_grace_hrs}h window.",
             fields=fields,
             webhook_url_override=discord_webhook_url,
             color=0xEF4444,
         )
-    elif tp3_hit:
+    elif tp1_hit and tp2_hit and tp3_hit:
         send_discord_webhook_alert(
-            event_key=f"tp3_hit_{coin}_{tf}",
-            title=f"TP3 Hit — {coin}USDT.P [{tf}] ({direction})",
-            description="Final target TP3 reached.",
+            event_key=f"all_tp_hit_{coin}_{tf}",
+            title=f"TP HIT — {coin}USDT.P [{tf}] ({direction})",
+            description=f"All TPs hit. Logged for backtest; closing active slot after {post_exit_grace_hrs}h window.",
             fields=fields,
             webhook_url_override=discord_webhook_url,
             color=0x10B981,
@@ -544,8 +682,8 @@ def _dispatch_discord_for_trade_state(trade: Dict[str, object], partner_summary:
     elif tp2_hit:
         send_discord_webhook_alert(
             event_key=f"tp2_hit_{coin}_{tf}",
-            title=f"TP2 Hit -> Break-Even & TP3 Watch — {coin}USDT.P [{tf}]",
-            description=f"TP2 hit. Hold Break-Even SL and watch TP3 ({eta_tp3}).",
+            title=f"TP2 Hit -> Break-Even & TP3 ({eta_tp3}) — {coin}USDT.P [{tf}]",
+            description=f"TP2 hit. Hold Break-Even SL and watch TP3 ({fmt_price(trade.get('tp3'))}).",
             fields=fields,
             webhook_url_override=discord_webhook_url,
             color=0x22C55E,
@@ -553,8 +691,8 @@ def _dispatch_discord_for_trade_state(trade: Dict[str, object], partner_summary:
     elif tp1_hit:
         send_discord_webhook_alert(
             event_key=f"tp1_hit_{coin}_{tf}",
-            title=f"TP1 Hit -> Shift SL to Break-Even & Target TP2 — {coin}USDT.P [{tf}]",
-            description=f"TP1 hit. Close if locking gains, or shift SL to Break-Even and look for TP2 ({eta_tp2}).",
+            title=f"TP1 Hit -> Close or Shift SL to BE for TP2 ({eta_tp2}) — {coin}USDT.P [{tf}]",
+            description=f"TP1 hit. Close at TP1 or shift SL to Break-Even and look for TP2 ({fmt_price(trade.get('tp2'))}).",
             fields=fields,
             webhook_url_override=discord_webhook_url,
             color=0x00C853,
@@ -569,12 +707,11 @@ def _dispatch_discord_for_trade_state(trade: Dict[str, object], partner_summary:
             color=0xF59E0B,
         )
 
-    if bad_confs or (wall != "Clear path"):
-        warn_reasons = list(bad_confs) + ([wall] if wall != "Clear path" else [])
+    if wall != "Clear path":
         send_discord_webhook_alert(
-            event_key=f"warn_{coin}_{tf}_{'|'.join(warn_reasons)}",
-            title=f"Price / Confluence Warning — {coin}USDT.P [{tf}]",
-            description=" | ".join(warn_reasons),
+            event_key=f"wall_{coin}_{tf}_{wall}",
+            title=f"Path Alert — {coin}USDT.P [{tf}]",
+            description=wall,
             fields=fields,
             webhook_url_override=discord_webhook_url,
             color=0xF97316,
@@ -585,82 +722,107 @@ for tr in st.session_state.active_trades:
     _dispatch_discord_for_trade_state(tr, partner_summary=None)
 
 
-def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, target_ctx: Dict[str, object]) -> None:
-    t_key = f"{target_coin}_{target_tf}"
-    prev_summary = st.session_state.ai_summaries.get(t_key)
-
-    st.session_state.audit_logs, t_audit = audit_and_correlate_summary(
+def _refresh_single_item_summary(coin: str, tf: str, ctx: Dict[str, object]) -> str:
+    key = f"{coin}_{tf}"
+    prev_summary = st.session_state.ai_summaries.get(key)
+    st.session_state.audit_logs, audit_entry = audit_and_correlate_summary(
         existing_audits=st.session_state.audit_logs,
-        target_coin=target_coin,
-        target_tf=target_tf,
-        setup_context=target_ctx,
+        target_coin=coin,
+        target_tf=tf,
+        setup_context=ctx,
         previous_summary=prev_summary,
         active_trades=st.session_state.active_trades,
         logbook=st.session_state.logbook,
     )
-
-    t_summary = run_on_demand_trader_agent(
-        target_coin=target_coin,
-        target_tf=target_tf,
-        setup_context=target_ctx,
+    summary = run_on_demand_trader_agent(
+        target_coin=coin,
+        target_tf=tf,
+        setup_context=ctx,
         all_committed_trades=st.session_state.active_trades,
         audit_history=st.session_state.audit_logs,
         api_key=ai_api_key,
         previous_summary=prev_summary,
-        audit_entry=t_audit,
+        audit_entry=audit_entry,
     )
-    st.session_state.ai_summaries[t_key] = t_summary
-    save_summary(t_key, target_coin, target_tf, t_summary)
+    st.session_state.ai_summaries[key] = summary
+    save_summary(key, coin, tf, summary)
+    return summary
+
+
+def trigger_agent_for_committed_and_target(target_coin: str, target_tf: str, target_ctx: Dict[str, object]) -> None:
+    """
+    Master run: whenever AI is invoked from any category/setup, it updates every
+    active trade AND every live scanned setup with its own individual context.
+    """
+    primary_summary = _refresh_single_item_summary(target_coin, target_tf, target_ctx)
 
     matched_tr = next(
         (t for t in st.session_state.active_trades if t.get("coin") == target_coin and t.get("timeframe") == target_tf),
         None,
     )
-    if matched_tr and discord_enabled:
-        _dispatch_discord_for_trade_state(matched_tr, partner_summary=t_summary)
-    elif discord_enabled:
-        send_discord_webhook_alert(
-            event_key=f"signal_partner_{t_key}_{target_ctx.get('entry_d')}",
-            title=f"Partner Setup Read — {target_coin}USDT.P [{target_tf}]",
-            description=t_summary[:1800],
-            fields=[
-                {"name": "Entry / Zone", "value": f"{fmt_price(target_ctx.get('entry_d') if isinstance(target_ctx.get('entry_d'), (int, float)) else None)} ({fmt_price(target_ctx.get('optimal_zone_low') if isinstance(target_ctx.get('optimal_zone_low'), (int, float)) else None)} - {fmt_price(target_ctx.get('optimal_zone_high') if isinstance(target_ctx.get('optimal_zone_high'), (int, float)) else None)})", "inline": True},
-                {"name": "Primary SL", "value": fmt_price(target_ctx.get("sl") if isinstance(target_ctx.get("sl"), (int, float)) else None), "inline": True},
-                {"name": "TP1 / TP2 / TP3", "value": f"{fmt_price(target_ctx.get('tp1') if isinstance(target_ctx.get('tp1'), (int, float)) else None)} / {fmt_price(target_ctx.get('tp2') if isinstance(target_ctx.get('tp2'), (int, float)) else None)} / {fmt_price(target_ctx.get('tp3') if isinstance(target_ctx.get('tp3'), (int, float)) else None)}", "inline": False},
-            ],
-            webhook_url_override=discord_webhook_url,
-            color=0x00C853 if target_ctx.get("pattern_type") == "BULLISH" else 0xFF3B3B,
-            force=True,
-        )
+    if discord_enabled:
+        if matched_tr:
+            _dispatch_discord_for_trade_state(matched_tr, partner_summary=primary_summary)
+        else:
+            send_discord_webhook_alert(
+                event_key=f"signal_partner_{target_coin}_{target_tf}_{target_ctx.get('entry_d')}",
+                title=f"Partner Setup Read — {target_coin}USDT.P [{target_tf}]",
+                description=primary_summary[:1800],
+                fields=[
+                    {"name": "Prob Score", "value": f"{target_ctx.get('total_score', 0)}/100", "inline": True},
+                    {"name": "Primary SL", "value": fmt_price(target_ctx.get("sl") if isinstance(target_ctx.get("sl"), (int, float)) else None), "inline": True},
+                    {"name": "TP1 / TP2 / TP3", "value": f"{fmt_price(target_ctx.get('tp1') if isinstance(target_ctx.get('tp1'), (int, float)) else None)} / {fmt_price(target_ctx.get('tp2') if isinstance(target_ctx.get('tp2'), (int, float)) else None)} / {fmt_price(target_ctx.get('tp3') if isinstance(target_ctx.get('tp3'), (int, float)) else None)}", "inline": False},
+                ],
+                webhook_url_override=discord_webhook_url,
+                color=0x00C853 if target_ctx.get("pattern_type") == "BULLISH" else 0xFF3B3B,
+                force=True,
+            )
+
+    visited = {(target_coin, target_tf)}
 
     for tr in st.session_state.active_trades:
         c = str(tr.get("coin", ""))
         tf = str(tr.get("timeframe", ""))
-        if not c or not tf or (c == target_coin and tf == target_tf):
+        if not c or not tf or (c, tf) in visited:
             continue
-        ckey = f"{c}_{tf}"
-        c_prev = st.session_state.ai_summaries.get(ckey)
-        st.session_state.audit_logs, c_audit = audit_and_correlate_summary(
-            existing_audits=st.session_state.audit_logs,
-            target_coin=c,
-            target_tf=tf,
-            setup_context=tr,
-            previous_summary=c_prev,
-            active_trades=st.session_state.active_trades,
-            logbook=st.session_state.logbook,
-        )
-        csum = run_on_demand_trader_agent(
-            target_coin=c,
-            target_tf=tf,
-            setup_context=tr,
-            all_committed_trades=st.session_state.active_trades,
-            audit_history=st.session_state.audit_logs,
-            api_key=ai_api_key,
-            previous_summary=c_prev,
-            audit_entry=c_audit,
-        )
-        st.session_state.ai_summaries[ckey] = csum
-        save_summary(ckey, c, tf, csum)
+        visited.add((c, tf))
+        tr_ctx = dict(tr)
+        tr_ctx["is_committed"] = True
+        _refresh_single_item_summary(c, tf, tr_ctx)
+
+    for sc in deduped_results:
+        if sc.status_label == "IDLE":
+            continue
+        if (sc.coin, sc.timeframe) in visited:
+            continue
+        visited.add((sc.coin, sc.timeframe))
+        sc_ctx: Dict[str, object] = {
+            "coin": sc.coin,
+            "timeframe": sc.timeframe,
+            "pattern_type": sc.pattern_type,
+            "status_label": sc.status_label,
+            "sig_code": sc.sig_code,
+            "conf_score": sc.conf_score,
+            "conf_pct": sc.conf_pct,
+            "total_score": sc.total_score,
+            "is_committed": (sc.coin, sc.timeframe) in committed_keys,
+            "entry_d": sc.entry_d,
+            "optimal_zone_low": sc.optimal_zone_low,
+            "optimal_zone_high": sc.optimal_zone_high,
+            "reversal_zone_low": sc.optimal_zone_low,
+            "reversal_zone_high": sc.optimal_zone_high,
+            "sl": sc.sl,
+            "secondary_sl": sc.secondary_sl,
+            "break_even_sl": sc.break_even_sl,
+            "tp1": sc.tp1,
+            "tp2": sc.tp2,
+            "tp3": sc.tp3,
+            "bias_change_level": sc.bias_change_level,
+            "tp_obstacle_note": sc.tp_obstacle_note,
+            "bad_confluences": sc.bad_confluences,
+            "mtf_notes": sc.mtf_notes,
+        }
+        _refresh_single_item_summary(sc.coin, sc.timeframe, sc_ctx)
 
 
 # 1. ACTIVE TRADE MONITORING TERMINAL
@@ -680,10 +842,10 @@ def _render_active_monitor_body() -> None:
                     continue
 
                 for idx, trade in enumerate(subset):
-                    coin = trade["coin"]
-                    tf = trade["timeframe"]
-                    direction = trade["pattern_type"]
-                    live_p = fetch_perp_last_price(to_perp_symbol(coin)) or trade.get("last_price")
+                    coin = str(trade["coin"])
+                    tf = str(trade["timeframe"])
+                    direction = str(trade["pattern_type"])
+                    live_p = last_price_by_coin.get(coin) or trade.get("last_price")
                     trade["last_price"] = live_p
                     sl_mode, active_sl_val, sl_action_note = evaluate_sl_and_tp_posture(trade)
                     trade["sl_mode"] = sl_mode
@@ -694,9 +856,9 @@ def _render_active_monitor_body() -> None:
                     sl_p = trade.get("sl")
                     tp1_p, tp2_p, tp3_p = trade.get("tp1"), trade.get("tp2"), trade.get("tp3")
                     sl_hit = bool(trade.get("sl_hit", False))
-                    any_tp_hit = bool(trade.get("tp1_hit") or trade.get("tp2_hit") or trade.get("tp3_hit"))
+                    all_tps_hit = bool(trade.get("tp1_hit") and trade.get("tp2_hit") and trade.get("tp3_hit"))
                     tf_h = TF_HOURS.get(tf, 1.0)
-                    liq_snap = fetch_liquidation_snapshot(coin, live_p)
+                    liq_snap = fetch_liquidation_snapshot(coin, live_p if isinstance(live_p, (int, float)) else None)
                     s_key = f"{coin}_{tf}"
 
                     with st.container(border=True):
@@ -704,52 +866,53 @@ def _render_active_monitor_body() -> None:
                         with c1:
                             st.markdown(f"### {coin}USDT.P · `{tf}`")
                             st.markdown(f"**{direction}** · `{trade.get('sig_code', 'C')}` ({trade.get('conf_pct', 0.0):.0f}%)")
-                            st.caption(f"Score: **{trade.get('total_score', 0)}/100**")
-                            st.caption(str(trade.get("momentum_note") or f"RSI {trade.get('rsi_val', 50)} · Stoch {trade.get('stoch_k_val', 50)}/{trade.get('stoch_d_val', 50)}"))
+                            st.caption(f"Prob Score: **{trade.get('total_score', 0)}/100**")
+                            st.caption(f"Feed: {source_used_by_coin.get(coin, 'Swap')}")
                             st.caption("COMMITTED")
 
                         with c2:
-                            st.markdown(f"**Live:** {fmt_price(live_p)}")
-                            st.markdown(f"**Committed Entry:** {fmt_price(entry_p)}")
-                            st.markdown(f"**Active SL ({sl_mode}):** `{fmt_price(active_sl_val)}`")
-                            st.caption(f"Primary SL: {fmt_price(sl_p)} | Secondary SL: {fmt_price(trade.get('secondary_sl'))}")
-                            st.caption(f"Break-Even SL: {fmt_price(trade.get('break_even_sl'))}")
+                            st.markdown(f"**Live:** {fmt_price(live_p if isinstance(live_p, (int, float)) else None)}")
+                            st.markdown(f"**Committed Entry:** {fmt_price(entry_p if isinstance(entry_p, (int, float)) else None)}")
+                            st.markdown(f"**Active SL ({sl_mode}):** `{fmt_price(active_sl_val if isinstance(active_sl_val, (int, float)) else None)}`")
+                            st.caption(f"Primary SL: {fmt_price(sl_p if isinstance(sl_p, (int, float)) else None)} | Secondary SL: {fmt_price(trade.get('secondary_sl') if isinstance(trade.get('secondary_sl'), (int, float)) else None)}")
+                            st.caption(f"Break-Even SL: {fmt_price(trade.get('break_even_sl') if isinstance(trade.get('break_even_sl'), (int, float)) else None)}")
 
                         with c3:
-                            if sl_hit and not any_tp_hit:
-                                st.error("SL HIT — MONITORING FROZEN (TP bars cleared)")
+                            if sl_hit:
+                                st.error(f"SL HIT — Logged for backtest (exits in up to {post_exit_grace_hrs:g}h)")
+                            elif all_tps_hit:
+                                st.success(f"TP HIT — All targets complete; logged for backtest (exits in up to {post_exit_grace_hrs:g}h)")
                             else:
-                                if sl_hit and any_tp_hit:
-                                    tp_done = [
-                                        t
-                                        for t, flag in (
-                                            ("TP1", trade.get("tp1_hit")),
-                                            ("TP2", trade.get("tp2_hit")),
-                                            ("TP3", trade.get("tp3_hit")),
-                                        )
-                                        if flag
-                                    ]
-                                    st.warning(f"SL HIT AFTER {', '.join(tp_done)} — Keeping TP & SL status until killed.")
-
                                 for tp_label, tp_val, hit_flag, mult_h in (
                                     ("TP1", tp1_p, trade.get("tp1_hit", False), 4.0 * tf_h),
                                     ("TP2", tp2_p, trade.get("tp2_hit", False), 8.0 * tf_h),
                                     ("TP3", tp3_p, trade.get("tp3_hit", False), 16.0 * tf_h),
                                 ):
-                                    prog = 100.0 if hit_flag else compute_tp_progress(live_p, entry_p, tp_val, sl_p, direction)
+                                    prog = 100.0 if hit_flag else compute_tp_progress(
+                                        live_p if isinstance(live_p, (int, float)) else None,
+                                        entry_p if isinstance(entry_p, (int, float)) else None,
+                                        tp_val if isinstance(tp_val, (int, float)) else None,
+                                        sl_p if isinstance(sl_p, (int, float)) else None,
+                                        direction,
+                                    )
                                     eta_str = "HIT" if hit_flag else format_eta_pkt(mult_h * (1.0 - prog / 100.0))
                                     if tp_label == "TP2":
                                         trade["eta_tp2"] = eta_str
                                     elif tp_label == "TP3":
                                         trade["eta_tp3"] = eta_str
-                                    st.progress(int(round(prog)), text=f"{tp_label} ({fmt_price(tp_val)}): {prog:.0f}% · {eta_str}")
+                                    st.progress(int(round(prog)), text=f"{tp_label} ({fmt_price(tp_val if isinstance(tp_val, (int, float)) else None)}): {prog:.0f}% · {eta_str}")
 
                         with c4:
-                            st.info(sl_action_note)
-                            if trade.get("bad_confluences"):
-                                st.warning("Watch: " + ", ".join(trade["bad_confluences"]))
+                            if sl_hit:
+                                st.error("SL HIT")
+                            elif all_tps_hit:
+                                st.success("TP HIT")
                             else:
-                                st.success("Momentum & Structure Aligned")
+                                st.info(sl_action_note)
+                                if trade.get("bad_confluences"):
+                                    st.warning("Confluence Watch: " + ", ".join(trade["bad_confluences"]))
+                                else:
+                                    st.success("Confluences Supporting")
 
                             st.caption(f"Wall: {trade.get('tp_obstacle_note', 'Clear path')}")
                             st.caption(f"Liq: {liq_snap.get('liq_note', '-')}")
@@ -765,9 +928,9 @@ def _render_active_monitor_body() -> None:
                                 st.rerun()
 
                         has_sum = s_key in st.session_state.ai_summaries
-                        btn_lbl = "Update Partner Read (Sync)" if has_sum else "Run Partner Read"
+                        btn_lbl = "Update All Categories (Master AI)" if has_sum else "Run All Categories (Master AI)"
                         with st.expander(f"Trading Partner Read — {coin} [{tf}]", expanded=False):
-                            b_col1, b_col2 = st.columns([1.4, 1.2])
+                            b_col1, b_col2 = st.columns([1.6, 1.2])
                             with b_col1:
                                 if st.button(btn_lbl, key=f"run_ai_tr_{tab_idx}_{idx}_{coin}_{tf}"):
                                     ctx_tr = dict(trade)
@@ -785,7 +948,7 @@ def _render_active_monitor_body() -> None:
                             if st.session_state.show_summary_toggle and has_sum:
                                 st.info(st.session_state.ai_summaries[s_key])
                             elif not has_sum:
-                                st.caption("Click **Run Partner Read** for live trade guidance & Discord sync.")
+                                st.caption("Click **Run All Categories** to update every trade & signal with its own read.")
     else:
         st.info("No active trades locked yet. Lock a CONFIRMED signal from the Bat Pattern tab below.")
 
@@ -824,7 +987,7 @@ with pattern_tabs[0]:
             with st.container(border=True):
                 st.markdown(
                     f"<span style='color:{badge_color};font-weight:700;'>{r.coin}USDT.P · {r.pattern_type} · [{r.timeframe}]</span> "
-                    f"— **`{r.sig_code}`** ({r.status_desc}) | Conf: **{r.conf_pct:.0f}%** | Score: **{r.total_score}/100**",
+                    f"— **`{r.sig_code}`** ({r.status_desc}) | Conf: **{r.conf_pct:.0f}%** | Prob Score: **{r.total_score}/100**",
                     unsafe_allow_html=True,
                 )
                 st.markdown(
@@ -833,10 +996,9 @@ with pattern_tabs[0]:
                     f"**TP1:** `{fmt_price(r.tp1)}` · "
                     f"**TP2/3:** `{fmt_price(r.tp2)} / {fmt_price(r.tp3)}`"
                 )
-                st.caption(r.momentum_note)
                 if not is_committed_already and r.zone_low is not None and r.zone_high is not None:
                     st.caption(
-                        f"**Optimal Entry / Reversal Zone:** {fmt_price(r.optimal_zone_low)} – {fmt_price(r.optimal_zone_high)} "
+                        f"**Prime Reversal / Entry Zone:** {fmt_price(r.optimal_zone_low)} – {fmt_price(r.optimal_zone_high)} "
                         f"({r.optimal_entry_status}) | {r.zone_label}: {fmt_price(r.zone_low)} – {fmt_price(r.zone_high)}"
                     )
                 elif is_committed_already:
@@ -850,9 +1012,9 @@ with pattern_tabs[0]:
                     st.caption(f"• {n}")
 
                 if not is_committed_already and r.beyond_optimal_entry:
-                    st.warning(f"Beyond Optimal Entry: {r.optimal_entry_status}")
+                    st.warning(f"Beyond Prime Zone: {r.optimal_entry_status}")
                 if r.bad_confluences:
-                    st.caption("Notes: " + ", ".join(r.bad_confluences))
+                    st.caption("Confluence flags: " + ", ".join(r.bad_confluences))
 
                 if is_confirmed:
                     if is_committed_already:
@@ -867,12 +1029,10 @@ with pattern_tabs[0]:
                             "conf_pct": r.conf_pct,
                             "total_score": r.total_score,
                             "bad_confluences": r.bad_confluences,
-                            "rsi_val": r.rsi_val,
-                            "stoch_k_val": r.stoch_k_val,
-                            "stoch_d_val": r.stoch_d_val,
-                            "momentum_note": r.momentum_note,
                             "beyond_optimal_entry": r.beyond_optimal_entry,
                             "optimal_entry_status": r.optimal_entry_status,
+                            "optimal_zone_low": r.optimal_zone_low,
+                            "optimal_zone_high": r.optimal_zone_high,
                             "entry_d": r.entry_d,
                             "sl": r.sl,
                             "secondary_sl": r.secondary_sl,
@@ -903,20 +1063,19 @@ with pattern_tabs[0]:
                         )
 
                         tf_h = TF_HOURS.get(r.timeframe, 1.0)
-                        if discord_enabled:
+                        if discord_enabled and r.total_score >= int(discord_low_threshold):
                             send_discord_webhook_alert(
                                 event_key=f"locked_{r.coin}_{r.timeframe}_{r.pattern_type}_{r.entry_d}",
-                                title=f"New Active Signal Locked — {r.coin}USDT.P [{r.timeframe}]",
+                                title=f"Active Signal Locked — {r.coin}USDT.P [{r.timeframe}]",
                                 description=(
-                                    f"**{r.pattern_type} (`{r.sig_code}`)** · Confidence **{r.conf_pct:.0f}%** · Score **{r.total_score}/100**\n"
-                                    f"{r.momentum_note}\n"
-                                    f"Reversal Zone: `{fmt_price(r.optimal_zone_low)}` – `{fmt_price(r.optimal_zone_high)}`"
+                                    f"**{r.pattern_type} (`{r.sig_code}`)** · Prob Score **{r.total_score}/100** · Conf **{r.conf_pct:.0f}%**\n"
+                                    f"Prime Reversal Zone: `{fmt_price(r.optimal_zone_low)}` – `{fmt_price(r.optimal_zone_high)}`"
                                 ),
                                 fields=[
                                     {"name": "Entry / Live", "value": f"{fmt_price(r.entry_d)} / {fmt_price(last_price_by_coin.get(r.coin) or r.last_close)}", "inline": True},
                                     {"name": "SL Plan", "value": f"Primary `{fmt_price(r.sl)}` · Sec `{fmt_price(r.secondary_sl)}` · BE `{fmt_price(r.break_even_sl)}`", "inline": True},
                                     {"name": "TP1 / TP2 / TP3", "value": f"`{fmt_price(r.tp1)}` / `{fmt_price(r.tp2)}` ({format_eta_pkt(8.0 * tf_h)}) / `{fmt_price(r.tp3)}` ({format_eta_pkt(16.0 * tf_h)})", "inline": False},
-                                    {"name": "Behavior & Path", "value": f"{s_note} · Wall: {r.tp_obstacle_note}", "inline": False},
+                                    {"name": "Expected Path", "value": f"{s_note} · {r.tp_obstacle_note}", "inline": False},
                                 ],
                                 webhook_url_override=discord_webhook_url,
                                 color=0x00C853 if r.pattern_type == "BULLISH" else 0xFF3B3B,
@@ -945,10 +1104,12 @@ with ctl2:
 with ctl3:
     live_p_sel = last_price_by_coin.get(chart_coin)
     liq_info = fetch_liquidation_snapshot(chart_coin, live_p_sel)
+    g_diff = gate_diff_pct_by_coin.get(chart_coin)
+    diff_txt = f"Gate vs Binance diff: {g_diff:.3f}%" if isinstance(g_diff, (int, float)) else str(liq_info["liq_note"])
     st.metric(
-        label=f"{chart_coin}USDT.P Live Swap Price",
+        label=f"{chart_coin}USDT.P ({source_used_by_coin.get(chart_coin, 'Swap')})",
         value=fmt_price(live_p_sel),
-        delta=str(liq_info["liq_note"]),
+        delta=diff_txt,
     )
 
 selected_scan = result_map.get((chart_coin, chart_tf))
@@ -961,7 +1122,7 @@ corr_val = corr_info.get("corr")
 spread_val = corr_info.get("spread_pct")
 
 st.caption(
-    f"Swap Feed Correlation ({corr_info.get('label')}): "
+    f"Feed Correlation ({corr_info.get('label')}): "
     f"**{corr_val if corr_val is not None else 'N/A'}** | "
     f"Ref Swap/Price: **{fmt_price(ref_price)}** | "
     f"Basis Spread: **{f'{spread_val:+.4f}%' if spread_val is not None else 'N/A'}**"
@@ -988,10 +1149,10 @@ with detail_tabs[0]:
             (t for t in st.session_state.active_trades if t.get("coin") == selected_scan.coin and t.get("timeframe") == selected_scan.timeframe),
             None,
         )
-        a_col1, a_col2 = st.columns([1.5, 1.2])
+        a_col1, a_col2 = st.columns([1.6, 1.2])
         with a_col1:
             if st.button(
-                "Update Partner Read (Sync)" if has_csum else "Run Partner Read",
+                "Update All Categories (Master AI)" if has_csum else "Run All Categories (Master AI)",
                 key="btn_chart_ai_agent",
             ):
                 ctx_payload: Dict[str, object] = {
@@ -1000,15 +1161,15 @@ with detail_tabs[0]:
                     "pattern_type": selected_scan.pattern_type,
                     "status_label": selected_scan.status_label,
                     "sig_code": selected_scan.sig_code,
+                    "conf_score": selected_scan.conf_score,
                     "conf_pct": selected_scan.conf_pct,
                     "total_score": selected_scan.total_score,
-                    "rsi_val": selected_scan.rsi_val,
-                    "stoch_k_val": selected_scan.stoch_k_val,
-                    "stoch_d_val": selected_scan.stoch_d_val,
                     "is_committed": is_selected_committed,
                     "entry_d": selected_scan.entry_d,
                     "optimal_zone_low": selected_scan.optimal_zone_low,
                     "optimal_zone_high": selected_scan.optimal_zone_high,
+                    "reversal_zone_low": selected_scan.optimal_zone_low,
+                    "reversal_zone_high": selected_scan.optimal_zone_high,
                     "sl": selected_scan.sl,
                     "secondary_sl": selected_scan.secondary_sl,
                     "break_even_sl": selected_scan.break_even_sl,
@@ -1023,6 +1184,7 @@ with detail_tabs[0]:
                     "active_sl_guidance": matched_trade.get("active_sl_guidance") if matched_trade else selected_scan.sl,
                     "tp1_hit": matched_trade.get("tp1_hit", False) if matched_trade else False,
                     "tp2_hit": matched_trade.get("tp2_hit", False) if matched_trade else False,
+                    "tp3_hit": matched_trade.get("tp3_hit", False) if matched_trade else False,
                     "sl_hit": matched_trade.get("sl_hit", False) if matched_trade else False,
                     "eta_tp2": matched_trade.get("eta_tp2", "") if matched_trade else "",
                     "eta_tp3": matched_trade.get("eta_tp3", "") if matched_trade else "",
@@ -1039,18 +1201,17 @@ with detail_tabs[0]:
         if st.session_state.show_summary_toggle and has_csum:
             st.info(st.session_state.ai_summaries[c_key])
         elif not has_csum:
-            st.caption("Click **Run Partner Read** for a crisp trading partner view and Discord sync.")
+            st.caption("Click **Run All Categories** to update every active trade & signal with its own read.")
 
 with detail_tabs[1]:
     if selected_scan:
         bullets = [
-            f"Swap Contract & Timeframe: {selected_scan.coin}USDT.P on {selected_scan.timeframe} ({selected_scan.pattern_type or 'NONE'} — {selected_scan.status_desc})",
-            f"Signal & Score: {selected_scan.sig_code} | Confidence {selected_scan.conf_pct:.0f}% ({selected_scan.conf_score}/3) | Total Score {selected_scan.total_score}/100",
-            f"Momentum: {selected_scan.momentum_note}",
+            f"Swap Contract & Timeframe: {selected_scan.coin}USDT.P ({source_used_by_coin.get(selected_scan.coin, 'Swap')}) on {selected_scan.timeframe} ({selected_scan.pattern_type or 'NONE'} — {selected_scan.status_desc})",
+            f"Signal & Probability Score: {selected_scan.sig_code} | Confluence {selected_scan.conf_pct:.0f}% ({selected_scan.conf_score}/3) | Score {selected_scan.total_score}/100",
         ]
         if not is_selected_committed:
             bullets.append(
-                f"Entry (D): {fmt_price(selected_scan.entry_d)} | Optimal Zone: {fmt_price(selected_scan.optimal_zone_low)} – {fmt_price(selected_scan.optimal_zone_high)} ({selected_scan.optimal_entry_status})"
+                f"Entry (D): {fmt_price(selected_scan.entry_d)} | Prime Zone: {fmt_price(selected_scan.optimal_zone_low)} – {fmt_price(selected_scan.optimal_zone_high)} ({selected_scan.optimal_entry_status})"
             )
         else:
             bullets.append(f"Committed Entry: {fmt_price(selected_scan.entry_d)} (Optimal entry hidden for committed trade)")
@@ -1084,7 +1245,7 @@ for sym in symbols_list:
 st.dataframe(pd.DataFrame(status_records), use_container_width=True, hide_index=True)
 
 st.divider()
-st.subheader("Core Signal Audit Logbook")
+st.subheader("Core Signal Audit Logbook (Backtest Archive)")
 log_tabs = st.tabs(HORIZONS)
 for tab, horizon in zip(log_tabs, HORIZONS):
     with tab:
@@ -1106,10 +1267,11 @@ for tab, horizon in zip(log_tabs, HORIZONS):
 
         if scoped:
             for i, r in enumerate(scoped[:30], start=1):
+                closed_note = f" · Closed: `{r.get('closed_pkt')}`" if r.get("closed_pkt") else ""
                 st.markdown(
                     f"**#{i} | {r.get('coin')}USDT.P [{r.get('timeframe')}] {r.get('pattern_type')}** — "
                     f"Outcome: `{r.get('outcome', 'TRACKING')}` · Stage: `{r.get('status_label')}` · "
-                    f"Score: `{r.get('total_score', 0)}/100` · Logged: `{r.get('timestamp_pkt')}`  \n"
+                    f"Score: `{r.get('total_score', 0)}/100` · Logged: `{r.get('timestamp_pkt')}`{closed_note}  \n"
                     f"Entry: `{fmt_price(r.get('entry_d'))}` | ATR SL: `{fmt_price(r.get('sl'))}` | "
                     f"TP1: `{fmt_price(r.get('tp1'))}` | TP2: `{fmt_price(r.get('tp2'))}` | TP3: `{fmt_price(r.get('tp3'))}`"
                 )
