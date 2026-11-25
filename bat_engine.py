@@ -167,7 +167,6 @@ def run_bat_engine(
     pv_l = params["pivot_left"]
     pv_r = params["pivot_right"]
     atr_m = params["atr_mult"]
-    max_stale_pct = float(params.get("max_signal_dist_pct", 18.0))
 
     piv_h_set = set(_pine_pivothigh(high, pv_l, pv_r))
     piv_l_set = set(_pine_pivotlow(low, pv_l, pv_r))
@@ -196,7 +195,7 @@ def run_bat_engine(
                 high_idx_arr.insert(0, cand_idx)
                 high_prc_arr.insert(0, float(high[cand_idx]))
                 high_rsi_arr.insert(0, float(rsi[cand_idx]))
-                if len(high_idx_arr) > 6:
+                if len(high_idx_arr) > 8:
                     high_idx_arr.pop()
                     high_prc_arr.pop()
                     high_rsi_arr.pop()
@@ -204,7 +203,7 @@ def run_bat_engine(
                 low_idx_arr.insert(0, cand_idx)
                 low_prc_arr.insert(0, float(low[cand_idx]))
                 low_rsi_arr.insert(0, float(rsi[cand_idx]))
-                if len(low_idx_arr) > 6:
+                if len(low_idx_arr) > 8:
                     low_idx_arr.pop()
                     low_prc_arr.pop()
                     low_rsi_arr.pop()
@@ -213,7 +212,9 @@ def run_bat_engine(
         cur_high = float(high[bar_idx])
         cur_low = float(low[bar_idx])
 
-        if internal_state == 0 or internal_state == 3:
+        # Allow detecting a fresh X-A-B-C Bat pattern even while a prior setup is active
+        if internal_state in (0, 2, 3):
+            found_bull = False
             if len(low_prc_arr) >= 2 and len(high_prc_arr) >= 2:
                 px_i, px_p = low_idx_arr[1], low_prc_arr[1]
                 pa_i, pa_p = high_idx_arr[1], high_prc_arr[1]
@@ -225,21 +226,25 @@ def run_bat_engine(
                     ab_h = pa_p - pb_p
                     c_ret = (pc_p - pb_p) / ab_h if ab_h != 0 else 0.0
                     if 0.382 <= b_ret <= 0.618 and c_ret >= 0.382 and pc_p < pa_p:
-                        internal_state = 1
-                        pattern_type = "BULLISH"
-                        error_msg = ""
-                        x_idx, x_price = px_i, px_p
-                        a_idx, a_price = pa_i, pa_p
-                        b_idx, b_price = pb_i, pb_p
-                        c_idx, c_price = pc_i, pc_p
-                        b_rsi = low_rsi_arr[0]
-                        tp1_hit = False
-                        tp2_hit = False
-                        d_price = a_price - (0.886 * xa_h)
-                        price_sl = (a_price - (1.113 * xa_h)) - (cur_atr * atr_m)
-                        price_tp1 = price_tp2 = price_tp3 = np.nan
+                        cand_d = a_price if False else (a_price - (0.886 * xa_h))
+                        cand_sl = (a_price - (1.113 * xa_h)) - (cur_atr * atr_m)
+                        if not (internal_state == 2 and c_idx == pc_i and abs(d_price - cand_d) < 1e-12) and cur_low > cand_sl:
+                            internal_state = 1
+                            pattern_type = "BULLISH"
+                            error_msg = ""
+                            x_idx, x_price = px_i, px_p
+                            a_idx, a_price = pa_i, pa_p
+                            b_idx, b_price = pb_i, pb_p
+                            c_idx, c_price = pc_i, pc_p
+                            b_rsi = low_rsi_arr[0]
+                            tp1_hit = False
+                            tp2_hit = False
+                            d_price = cand_d
+                            price_sl = cand_sl
+                            price_tp1 = price_tp2 = price_tp3 = np.nan
+                            found_bull = True
 
-            if internal_state == 0 and len(high_prc_arr) >= 2 and len(low_prc_arr) >= 2:
+            if not found_bull and len(high_prc_arr) >= 2 and len(low_prc_arr) >= 2:
                 px_i, px_p = high_idx_arr[1], high_prc_arr[1]
                 pa_i, pa_p = low_idx_arr[1], low_prc_arr[1]
                 pb_i, pb_p = high_idx_arr[0], high_prc_arr[0]
@@ -250,19 +255,22 @@ def run_bat_engine(
                     ab_h = pb_p - pa_p
                     c_ret = (pb_p - pc_p) / ab_h if ab_h != 0 else 0.0
                     if 0.382 <= b_ret <= 0.618 and c_ret >= 0.382 and pc_p > pa_p:
-                        internal_state = 1
-                        pattern_type = "BEARISH"
-                        error_msg = ""
-                        x_idx, x_price = px_i, px_p
-                        a_idx, a_price = pa_i, pa_p
-                        b_idx, b_price = pb_i, pb_p
-                        c_idx, c_price = pc_i, pc_p
-                        b_rsi = high_rsi_arr[0]
-                        tp1_hit = False
-                        tp2_hit = False
-                        d_price = a_price + (0.886 * xa_h)
-                        price_sl = (a_price + (1.113 * xa_h)) + (cur_atr * atr_m)
-                        price_tp1 = price_tp2 = price_tp3 = np.nan
+                        cand_d = a_price + (0.886 * xa_h)
+                        cand_sl = (a_price + (1.113 * xa_h)) + (cur_atr * atr_m)
+                        if not (internal_state == 2 and c_idx == pc_i and abs(d_price - cand_d) < 1e-12) and cur_high < cand_sl:
+                            internal_state = 1
+                            pattern_type = "BEARISH"
+                            error_msg = ""
+                            x_idx, x_price = px_i, px_p
+                            a_idx, a_price = pa_i, pa_p
+                            b_idx, b_price = pb_i, pb_p
+                            c_idx, c_price = pc_i, pc_p
+                            b_rsi = high_rsi_arr[0]
+                            tp1_hit = False
+                            tp2_hit = False
+                            d_price = cand_d
+                            price_sl = cand_sl
+                            price_tp1 = price_tp2 = price_tp3 = np.nan
 
         if internal_state == 1:
             if pattern_type == "BULLISH":
@@ -317,15 +325,6 @@ def run_bat_engine(
     cur_atr = float(atr[last_i])
     avg_atr = float(np.nanmean(atr[max(0, last_i - 30) : last_i + 1])) or cur_atr
 
-    # Filter out stale/far-away historical signals so panels show live/relevant setups
-    if internal_state in (1, 2) and not np.isnan(d_price) and cur_close > 0:
-        dist_pct = abs(cur_close - float(d_price)) / cur_close * 100.0
-        bars_since_c = (last_i - c_idx) if c_idx >= 0 else 0
-        if dist_pct > max_stale_pct or bars_since_c > 60:
-            internal_state = 0
-            pattern_type = ""
-            d_price = price_sl = price_tp1 = price_tp2 = price_tp3 = np.nan
-
     vol_recent = float(np.nanmean(volume[max(0, last_i - 5) : last_i + 1]))
     vol_base = float(np.nanmean(volume[max(0, last_i - 30) : last_i + 1])) or 1.0
     vol_ratio = vol_recent / vol_base
@@ -347,9 +346,9 @@ def run_bat_engine(
         trend_ok = False
         if pattern_type == "BULLISH":
             rsi_div = (not np.isnan(b_rsi)) and (d_price <= b_price) and (cur_rsi > b_rsi)
-            stoch_ok = (cur_k < 45.0) and (cur_k >= cur_d - 3.0)
+            stoch_ok = (cur_k < 50.0) and (cur_k >= cur_d - 4.0)
             trend_ok = cur_close > cur_ema
-            momentum_note = f"Live RSI {cur_rsi:.1f} · Stoch K/D {cur_k:.1f}/{cur_d:.1f} ({'Bullish cross/zone' if stoch_ok else 'Mid/cooling'})"
+            momentum_note = f"Live RSI {cur_rsi:.1f} · Stoch K/D {cur_k:.1f}/{cur_d:.1f}"
             if not rsi_div:
                 bad_confluences.append(f"RSI {cur_rsi:.1f} (no fresh bullish div)")
             if not stoch_ok:
@@ -358,9 +357,9 @@ def run_bat_engine(
                 bad_confluences.append("Price below Trend EMA")
         elif pattern_type == "BEARISH":
             rsi_div = (not np.isnan(b_rsi)) and (d_price >= b_price) and (cur_rsi < b_rsi)
-            stoch_ok = (cur_k > 55.0) and (cur_k <= cur_d + 3.0)
+            stoch_ok = (cur_k > 50.0) and (cur_k <= cur_d + 4.0)
             trend_ok = cur_close < cur_ema
-            momentum_note = f"Live RSI {cur_rsi:.1f} · Stoch K/D {cur_k:.1f}/{cur_d:.1f} ({'Bearish cross/zone' if stoch_ok else 'Mid/rebounding'})"
+            momentum_note = f"Live RSI {cur_rsi:.1f} · Stoch K/D {cur_k:.1f}/{cur_d:.1f}"
             if not rsi_div:
                 bad_confluences.append(f"RSI {cur_rsi:.1f} (no fresh bearish div)")
             if not stoch_ok:
@@ -440,7 +439,7 @@ def run_bat_engine(
             bias_change_level = float(min(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
             if cur_close < d_f - opt_pad:
                 beyond_optimal_entry = True
-                optimal_entry_status = "Beyond Optimal Entry (Below D)"
+                optimal_entry_status = "Below D Zone (Deep Pullback / Active)"
             elif abs(cur_close - d_f) <= opt_pad:
                 optimal_entry_status = "In Optimal Reversal Zone"
             else:
@@ -457,7 +456,7 @@ def run_bat_engine(
             bias_change_level = float(max(b_price, cur_ema)) if not np.isnan(b_price) else cur_ema
             if cur_close > d_f + opt_pad:
                 beyond_optimal_entry = True
-                optimal_entry_status = "Beyond Optimal Entry (Above D)"
+                optimal_entry_status = "Above D Zone (Extended / Active)"
             elif abs(cur_close - d_f) <= opt_pad:
                 optimal_entry_status = "In Optimal Reversal Zone"
             else:
