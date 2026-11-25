@@ -126,6 +126,26 @@ def load_logbook() -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+def _persist_logbook(records: List[Dict[str, Any]]) -> None:
+    trimmed = records[:500]
+    _write_json("signal_logbook", trimmed)
+    if trimmed:
+        top = trimmed[0]
+        rec_id = f"{top.get('coin','')}_{top.get('timeframe','')}_{top.get('pattern_type','')}_{top.get('ts_epoch','')}"
+        _exec_turso(
+            [
+                {
+                    "sql": "INSERT OR REPLACE INTO signal_logbook (id, ts_epoch, payload) VALUES (?, ?, ?)",
+                    "args": [
+                        {"type": "text", "value": rec_id},
+                        {"type": "float", "value": float(top.get("ts_epoch", datetime.now(PKT_TZ).timestamp()))},
+                        {"type": "text", "value": json.dumps(top, default=str)},
+                    ],
+                }
+            ]
+        )
+
+
 def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: List[Any]) -> List[Dict[str, Any]]:
     records = list(existing_logbook) if isinstance(existing_logbook, list) else []
     seen_keys = {
@@ -157,6 +177,7 @@ def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: Li
                 "pattern_type": ptype,
                 "status_label": status,
                 "total_score": getattr(res, "total_score", 0),
+                "conf_pct": getattr(res, "conf_pct", 0.0),
                 "entry_d": entry_d,
                 "sl": getattr(res, "sl", None),
                 "tp1": getattr(res, "tp1", None),
@@ -167,6 +188,7 @@ def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: Li
                 "tp3_hit": False,
                 "sl_hit": False,
                 "outcome": "TRACKING",
+                "closed_pkt": "",
                 "ts_epoch": now_ts,
                 "timestamp_pkt": pkt_str,
             },
@@ -174,9 +196,8 @@ def record_generated_signals(existing_logbook: List[Dict[str, Any]], results: Li
         added = True
 
     if added:
-        records = records[:300]
-        _write_json("signal_logbook", records)
-    return records
+        _persist_logbook(records)
+    return records[:500]
 
 
 def sync_logbook_outcomes(
@@ -184,14 +205,11 @@ def sync_logbook_outcomes(
     active_trades: List[Dict[str, Any]],
     last_price_by_coin: Dict[str, Optional[float]],
 ) -> List[Dict[str, Any]]:
-    """
-    Syncs TP1/TP2/TP3/SL hits from active trades and live swap prices into the
-    Core Signal Audit Logbook so TP Hits (TP1+) and SL Hits stay accurate.
-    """
     if not logbook:
         return []
 
     updated = False
+    now_pkt = datetime.now(PKT_TZ).strftime("%Y-%m-%d %H:%M PKT")
     active_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {
         (str(t.get("coin", "")), str(t.get("timeframe", "")), str(t.get("pattern_type", ""))): t
         for t in active_trades
@@ -234,14 +252,15 @@ def sync_logbook_outcomes(
                 if isinstance(sl, (int, float)) and live_p >= sl:
                     sl_hit = True
 
-        if tp3_hit:
-            new_outcome = "TP3 HIT"
+        all_tps_hit = tp1_hit and tp2_hit and tp3_hit
+        if all_tps_hit:
+            new_outcome = "TP HIT"
+        elif sl_hit:
+            new_outcome = "SL HIT"
         elif tp2_hit:
             new_outcome = "TP2 HIT"
         elif tp1_hit:
             new_outcome = "TP1 HIT"
-        elif sl_hit:
-            new_outcome = "SL HIT"
         else:
             new_outcome = "TRACKING"
 
@@ -257,10 +276,12 @@ def sync_logbook_outcomes(
             rec["tp3_hit"] = tp3_hit
             rec["sl_hit"] = sl_hit
             rec["outcome"] = new_outcome
+            if new_outcome in ("TP HIT", "SL HIT") and not rec.get("closed_pkt"):
+                rec["closed_pkt"] = now_pkt
             updated = True
 
     if updated:
-        _write_json("signal_logbook", logbook)
+        _persist_logbook(logbook)
     return logbook
 
 
@@ -333,19 +354,17 @@ def audit_and_correlate_summary(
     active_trades: List[Dict[str, Any]],
     logbook: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Silent background memory correlation & accuracy updater on every rerun.
-    """
     audits = list(existing_audits) if isinstance(existing_audits, list) else []
     now_dt = datetime.now(PKT_TZ)
     now_ts = now_dt.timestamp()
 
     coin_past_audits = [a for a in audits if a.get("coin") == target_coin and a.get("timeframe") == target_tf]
-    prev_accuracy = float(coin_past_audits[0].get("accuracy_pct", 74.0)) if coin_past_audits else 74.0
+    prev_accuracy = float(coin_past_audits[0].get("accuracy_pct", 76.0)) if coin_past_audits else 76.0
 
     missed_items: List[str] = []
     tp1_hit = bool(setup_context.get("tp1_hit", False))
     tp2_hit = bool(setup_context.get("tp2_hit", False))
+    tp3_hit = bool(setup_context.get("tp3_hit", False))
     sl_hit = bool(setup_context.get("sl_hit", False))
     sl_mode = str(setup_context.get("sl_mode") or "PRIMARY SL")
     bad_confs = setup_context.get("bad_confluences") or []
@@ -354,30 +373,36 @@ def audit_and_correlate_summary(
     if previous_summary:
         prev_l = previous_summary.lower()
         if tp1_hit and "tp1" not in prev_l:
-            missed_items.append("TP1 hit & Break-Even / TP2 transition")
+            missed_items.append("TP1 hit & Break-Even / TP2 decision")
         if tp2_hit and "tp2" not in prev_l:
             missed_items.append("TP2 hit & TP3 / Break-Even protection")
+        if tp3_hit and "tp3" not in prev_l:
+            missed_items.append("TP3 hit / full target completion")
+        if sl_hit and "sl" not in prev_l and "stop" not in prev_l:
+            missed_items.append("SL hit & exit")
         if sl_mode != "PRIMARY SL" and "break-even" not in prev_l and "secondary" not in prev_l:
-            missed_items.append(f"SL posture shift ({sl_mode})")
-        if bad_confs and "rsi" not in prev_l and "stoch" not in prev_l:
-            missed_items.append("Live RSI / Stoch RSI momentum reading")
+            missed_items.append(f"SL posture ({sl_mode})")
+        if bad_confs and "confluence" not in prev_l and "momentum" not in prev_l:
+            missed_items.append("Confluence shift")
         if wall != "Clear path" and "wall" not in prev_l and "resistance" not in prev_l and "support" not in prev_l:
-            missed_items.append(f"Path obstacle ({wall})")
+            missed_items.append(f"Path level ({wall})")
 
-    new_accuracy = round(min(99.0, prev_accuracy + (5.0 if missed_items else 3.0)), 1)
+    new_accuracy = round(min(99.0, prev_accuracy + (4.5 if missed_items else 2.5)), 1)
 
     entry = {
         "ts_epoch": now_ts,
         "audited_pkt": now_dt.strftime("%Y-%m-%d %H:%M PKT"),
         "coin": target_coin,
         "timeframe": target_tf,
-        "outcome_seen": f"Mode:{sl_mode} | TP1:{int(tp1_hit)} TP2:{int(tp2_hit)} SL:{int(sl_hit)}",
+        "outcome_seen": f"Mode:{sl_mode} | TP1:{int(tp1_hit)} TP2:{int(tp2_hit)} TP3:{int(tp3_hit)} SL:{int(sl_hit)}",
         "missed_items": missed_items,
         "accuracy_pct": new_accuracy,
         "lesson_learned": (
-            f"Updated with {', '.join(missed_items)}." if missed_items else "Aligned with latest price/TP/SL state."
+            f"Correlated with prior message; updated: {', '.join(missed_items)}."
+            if missed_items
+            else "Consistent with prior message; live context synced."
         ),
-        "rule_adjustment": "Prioritize TP1 close/BE shift -> TP2 continuation and live RSI/Stoch context.",
+        "rule_adjustment": "Keep partner guidance concise, actionable, and free of raw indicator dumps.",
     }
     audits.insert(0, entry)
     _save_audit_logs(audits)
@@ -399,48 +424,64 @@ def _build_partner_layman_summary(
     target_tf: str,
     setup_context: Dict[str, Any],
     audit_entry: Optional[Dict[str, Any]] = None,
+    previous_summary: Optional[str] = None,
     api_note: str = "",
 ) -> str:
     direction = str(setup_context.get("pattern_type") or "SETUP")
     is_committed = bool(setup_context.get("is_committed", False))
     conf_pct = setup_context.get("conf_pct", 0.0)
     score = setup_context.get("total_score", 0)
-    rsi_v = setup_context.get("rsi_val", 50.0)
-    sk_v = setup_context.get("stoch_k_val", 50.0)
-    sd_v = setup_context.get("stoch_d_val", 50.0)
     tp1_hit = bool(setup_context.get("tp1_hit", False))
     tp2_hit = bool(setup_context.get("tp2_hit", False))
+    tp3_hit = bool(setup_context.get("tp3_hit", False))
     sl_hit = bool(setup_context.get("sl_hit", False))
     wall = str(setup_context.get("tp_obstacle_note") or "Clear path")
     eta_tp2 = str(setup_context.get("eta_tp2") or "")
     eta_tp3 = str(setup_context.get("eta_tp3") or "")
-    acc_pct = (audit_entry or {}).get("accuracy_pct", 78.0)
+    opt_low = setup_context.get("optimal_zone_low")
+    opt_high = setup_context.get("optimal_zone_high")
+    rev_low = setup_context.get("reversal_zone_low", opt_low)
+    rev_high = setup_context.get("reversal_zone_high", opt_high)
+    confs_ok = int(setup_context.get("conf_score", 0) or 0)
 
     if sl_hit:
-        game_plan = "Stop loss hit—step back, protect capital, and wait for the next clean structure rather than chasing."
+        call = "SL hit—close/step out and wait for a fresh setup."
+    elif tp3_hit or (tp1_hit and tp2_hit and tp3_hit):
+        call = "All TPs hit—take full profit and let the trade roll off after the close window."
     elif tp2_hit:
-        game_plan = f"TP2 is in the bag. Lock SL at Break-Even, let remaining size work toward TP3 ({eta_tp3 or 'pending'}), or take profits if momentum fades."
+        call = f"TP2 hit—keep SL at Break-Even and look for TP3 ({eta_tp3 or 'next leg'}), or lock gains if momentum slows."
     elif tp1_hit:
-        game_plan = (
-            f"TP1 hit—you can close/take TP1 profit here, OR shift SL to Break-Even and look for TP2 ({eta_tp2 or 'next target'}). "
-            f"If you closed at TP1 and want back in for TP2, wait for a clean pullback/reversal reaction rather than chasing."
-        )
+        if confs_ok >= 2 and wall == "Clear path":
+            call = (
+                f"TP1 hit—close here to lock gains, or move SL to Break-Even and look for TP2 ({eta_tp2 or 'pending'}). "
+                f"If closed at TP1, look for a reversal zone around {rev_low} – {rev_high} before re-entering."
+            )
+        else:
+            call = (
+                f"TP1 hit—momentum/path has friction ({wall}), so closing at TP1 is cleaner than forcing TP2; "
+                f"only look to re-enter near {rev_low} – {rev_high} if price reacts cleanly."
+            )
     elif is_committed:
-        game_plan = (
-            f"Trade is live—start with Primary SL, trail with Secondary SL once price moves in your favor, "
-            f"and shift SL to Break-Even once TP1 is hit to target TP2 ({eta_tp2 or 'pending'})."
+        call = (
+            f"Trade active—hold Primary SL, trail with Secondary SL on favorable push, "
+            f"and shift SL to Break-Even on TP1 toward TP2 ({eta_tp2 or 'pending'})."
         )
     else:
-        opt_low = setup_context.get("optimal_zone_low")
-        opt_high = setup_context.get("optimal_zone_high")
-        game_plan = f"Wait for price inside the optimal entry/reversal zone ({opt_low} – {opt_high}) before committing."
+        call = f"Wait for price inside the prime reversal/entry zone ({opt_low} – {opt_high}) before committing."
 
-    prefix = f"*(Feed note: {api_note})*\n\n" if api_note else ""
+    if previous_summary:
+        return (
+            f"**{target_coin}USDT.P [{target_tf}] · {direction} (Prob {score}/100 · Conf {conf_pct:.0f}%)**\n"
+            f"* **Update:** {call}\n"
+            f"* **Path:** {wall}."
+        )
+
+    prefix = f"*(Note: {api_note})*\n\n" if api_note else ""
     return (
         f"{prefix}"
-        f"**{target_coin}USDT.P [{target_tf}] · {direction} (Confidence {conf_pct:.0f}% · Score {score}/100 · Model Acc {acc_pct}%)**\n\n"
-        f"* **Read:** {game_plan}\n"
-        f"* **Momentum Now:** RSI `{rsi_v}` · Stoch K/D `{sk_v}/{sd_v}` · Path: `{wall}`."
+        f"**{target_coin}USDT.P [{target_tf}] · {direction} (Prob {score}/100 · Conf {conf_pct:.0f}%)**\n"
+        f"* **Plan:** {call}\n"
+        f"* **Confluences & Path:** {confs_ok}/3 active confluences · {wall}."
     )
 
 
@@ -461,7 +502,8 @@ def run_on_demand_trader_agent(
             target_tf,
             setup_context,
             audit_entry=audit_entry,
-            api_note="Set OPENROUTER_API_KEY in Streamlit Secrets for AI partner prose",
+            previous_summary=previous_summary,
+            api_note="Add OPENROUTER_API_KEY in Secrets for custom AI prose",
         )
 
     model = _get_secret("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL) or DEFAULT_OPENROUTER_MODEL
@@ -472,21 +514,25 @@ def run_on_demand_trader_agent(
         "X-Title": _get_secret("OPENROUTER_APP_NAME", "Harmonics Engine"),
     }
 
+    is_rerun = bool(previous_summary)
     system_prompt = (
-        "You are a sharp, calm, practical crypto swap trading partner—never robotic, never lecturing, "
-        "and never saying 'I audited you' or 'self-audit'. Silently use the previous summary and "
-        "context updates so your response is accurate and up to date. Always state Confidence %, "
-        "live RSI and Stoch K/D, and clear trade guidance: if TP1 is hit, tell the user they can close at TP1 "
-        "or shift SL to Break-Even and look for TP2 (and if closed at TP1, wait for a clean reversal zone before "
-        "re-entering for TP2). Keep it crisp, human, and easy to read in 4-5 short bullets."
+        "You are a sharp, calm trading partner—never robotic, never lecturing, never mentioning 'audit' or 'self-audit'. "
+        "Do NOT dump raw RSI or Stoch RSI numbers; treat them purely as confluences feeding the probability score. "
+        "When TP1 is hit, give a concrete call: close at TP1, or shift SL to Break-Even for TP2, or give specific "
+        "reversal zone price levels if re-entering for TP2. "
+        + (
+            "A previous summary already exists: be extra concise and focus on what changed or needs action now."
+            if is_rerun
+            else "Give a crisp, complete partner summary in 3 short bullets."
+        )
     )
     user_payload = {
         "coin": target_coin,
         "timeframe": target_tf,
-        "setup": setup_context,
+        "is_rerun": is_rerun,
         "previous_summary": previous_summary or "",
-        "background_correlation_notes": (audit_entry or {}).get("missed_items", []),
-        "committed_count": len(all_committed_trades),
+        "setup": setup_context,
+        "recent_logbook_sample": all_committed_trades[:8],
     }
 
     try:
@@ -499,8 +545,8 @@ def run_on_demand_trader_agent(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps(user_payload, default=str)},
                 ],
-                "temperature": 0.25,
-                "max_tokens": 420,
+                "temperature": 0.2,
+                "max_tokens": 320 if is_rerun else 420,
             },
             timeout=20,
         )
@@ -510,13 +556,16 @@ def run_on_demand_trader_agent(
         content = (((choices[0] or {}).get("message") or {}).get("content") or "").strip()
         if content:
             return content
-        return _build_partner_layman_summary(target_coin, target_tf, setup_context, audit_entry=audit_entry)
+        return _build_partner_layman_summary(
+            target_coin, target_tf, setup_context, audit_entry=audit_entry, previous_summary=previous_summary
+        )
     except Exception as exc:
         return _build_partner_layman_summary(
             target_coin,
             target_tf,
             setup_context,
             audit_entry=audit_entry,
+            previous_summary=previous_summary,
             api_note=str(exc),
         )
 
@@ -542,7 +591,7 @@ def send_discord_webhook_alert(
         return False
 
     payload = {
-        "username": "Harmonics Partner Bot",
+        "username": "Harmonics Partner",
         "embeds": [
             {
                 "title": title[:250],
